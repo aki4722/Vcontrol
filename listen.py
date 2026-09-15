@@ -7,6 +7,7 @@ import os
 import queue
 import re
 import signal
+import shutil
 import subprocess
 import threading
 import wave
@@ -34,7 +35,13 @@ WEB_PORT = int(os.environ.get("WEB_PORT", "5000"))
 ALSA_VOLUME_CONTROL = "Master"
 OLED_PORT = int(os.environ.get("OLED_PORT", "1"), 0)
 OLED_ADDRESS = int(os.environ.get("OLED_ADDRESS", "0x3c"), 0)
-OLED_FONT = BASE_DIR / "assets/fonts/SpaceMono-Bold.ttf"
+OLED_FONT = Path("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
+OLED_FONT_SIZE = 12
+OLED_FOOTER_FONT_SIZE = 10
+CPU_TEMP_FILE = Path("/sys/class/thermal/thermal_zone0/temp")
+CPU_TEMP_UPDATE_SECONDS = 30
+STORAGE_UPDATE_SECONDS = 30
+REC_BLINK_SECONDS = 0.5
 
 log = logging.getLogger(__name__)
 app = Flask(__name__)
@@ -59,6 +66,10 @@ matrix_columns = []
 cleanup_done = False
 oled_device = None
 oled_thread = None
+cpu_temperature_text = "CPU --c"
+cpu_temperature_updated_at = None
+storage_free_text = "FREE --G"
+storage_free_updated_at = None
 
 
 def load_stations():
@@ -83,8 +94,36 @@ def _oled_station_name(station):
     return station["id"]
 
 
+def _cpu_temperature_text():
+    """CPU温度を30秒ごとに読み、OLED向けの短いASCII文字列で返す。"""
+    global cpu_temperature_text, cpu_temperature_updated_at
+    now = time.monotonic()
+    if cpu_temperature_updated_at is None or now - cpu_temperature_updated_at >= CPU_TEMP_UPDATE_SECONDS:
+        try:
+            temperature = int(CPU_TEMP_FILE.read_text(encoding="ascii").strip()) / 1000
+            cpu_temperature_text = f"CPU {temperature:.0f}c"
+        except (OSError, ValueError):
+            cpu_temperature_text = "CPU --c"
+        cpu_temperature_updated_at = now
+    return cpu_temperature_text
+
+
+def _storage_free_text():
+    """録音保存先の空き容量を30秒ごとに取得する。"""
+    global storage_free_text, storage_free_updated_at
+    now = time.monotonic()
+    if storage_free_updated_at is None or now - storage_free_updated_at >= STORAGE_UPDATE_SECONDS:
+        try:
+            free_gib = shutil.disk_usage(SAVE_DIR).free / (1024 ** 3)
+            storage_free_text = f"FREE {free_gib:.0f}G"
+        except OSError:
+            storage_free_text = "FREE --G"
+        storage_free_updated_at = now
+    return storage_free_text
+
+
 def _oled_lines():
-    """現在の状態を128x64 OLED向けの4行にまとめる。"""
+    """現在の状態を128x64 OLED向けの表示要素にまとめる。"""
     with control_lock:
         _reconcile_recording()
         if radio_process is not None and radio_process.poll() is not None:
@@ -94,10 +133,11 @@ def _oled_lines():
             elapsed = max(0, int((now - recording_started_at).total_seconds()))
             hours, remainder = divmod(elapsed, 3600)
             minutes, seconds = divmod(remainder, 60)
-            return (now.strftime("%Y-%m-%d %H:%M"), "REC", f"TIME {hours:02}:{minutes:02}:{seconds:02}", "")
+            rec_visible = int(time.monotonic() / REC_BLINK_SECONDS) % 2 == 0
+            return (now.strftime("%Y-%m-%d %H:%M"), "REC", f"TIME {hours:02}:{minutes:02}:{seconds:02}", _storage_free_text(), _cpu_temperature_text(), rec_visible)
         if radio_process is not None:
-            return (now.strftime("%Y-%m-%d %H:%M"), "RADIO", _oled_station_name(current_station), "PLAY")
-        return (now.strftime("%Y-%m-%d %H:%M"), "READY", "VOICE CONTROL", "")
+            return (now.strftime("%Y-%m-%d %H:%M"), "RADIO", _oled_station_name(current_station), _storage_free_text(), _cpu_temperature_text(), True)
+        return (now.strftime("%Y-%m-%d %H:%M"), "READY", "VOICE CONTROL", _storage_free_text(), _cpu_temperature_text(), True)
 
 
 def oled_worker():
@@ -105,22 +145,23 @@ def oled_worker():
     from luma.core.render import canvas
     from PIL import ImageFont
 
-    time_font = ImageFont.truetype(OLED_FONT, 11)
-    status_font = ImageFont.truetype(OLED_FONT, 18)
-    detail_font = ImageFont.truetype(OLED_FONT, 13)
-    footer_font = ImageFont.truetype(OLED_FONT, 10)
+    # SSD1309のmode="1"キャンバスへ直接描画し、中間階調を作らない。
+    oled_font = ImageFont.truetype(OLED_FONT, OLED_FONT_SIZE)
+    footer_font = ImageFont.truetype(OLED_FONT, OLED_FOOTER_FONT_SIZE)
     previous = None
     try:
         while not shutdown_event.is_set():
             lines = _oled_lines()
             if lines != previous:
                 with canvas(oled_device) as draw:
-                    draw.text((3, -2), lines[0], font=time_font, fill="white")
-                    draw.line((3, 13, 124, 13), fill="white")
-                    draw.text((3, 14), lines[1], font=status_font, fill="white")
-                    draw.text((3, 38), lines[2][:18], font=detail_font, fill="white")
+                    draw.text((2, -2), lines[0], font=oled_font, fill="white")
+                    draw.line((2, 13, 125, 13), fill="white")
+                    if lines[5]:
+                        draw.text((2, 14), lines[1], font=oled_font, fill="white")
+                    draw.text((2, 31), lines[2][:18], font=oled_font, fill="white")
+                    draw.text((2, 52), lines[4], font=footer_font, fill="white")
                     if lines[3]:
-                        draw.text((125, 52), lines[3], font=footer_font, fill="white", anchor="ra")
+                        draw.text((126, 52), lines[3], font=footer_font, fill="white", anchor="ra")
                 previous = lines
             shutdown_event.wait(0.5)
     except Exception:

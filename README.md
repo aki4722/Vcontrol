@@ -58,9 +58,13 @@ venv/bin/python oled_test.py --address 0x3c
 テスト文字は10秒間表示されます。表示を維持する場合は `--seconds 0` を追加します。
 このテストは独立したプログラムで、既存の録音・ラジオ常駐サービスには影響しません。
 
-常駐サービスではOLEDに現在時刻と `READY`、`REC`、`RADIO` の状態を
-自動表示します。録音中は経過時間、ラジオ再生中は局IDも
-表示します。I2Cバスとアドレスは `.env` の `OLED_PORT`、`OLED_ADDRESS` で変更できます。
+常駐サービスではOLEDに現在時刻、CPU温度と `READY`、`REC`、`RADIO` の状態を
+自動表示します。CPU温度と録音保存先の空き容量は30秒ごとに更新され、
+画面下部に `CPU 45c`、`FREE 24G` の形式で表示されます。
+録音中は経過時間、ラジオ再生中は局IDも
+表示し、`REC` は0.5秒間隔で点滅します。
+I2Cバスとアドレスは `.env` の `OLED_PORT`、`OLED_ADDRESS` で変更できます。
+文字にはDejaVu Sans Mono 12px、CPU温度と空き容量には10pxを使用し、1bitで描画します。
 OLEDが未接続または故障していても、録音・ラジオ機能は継続します。
 
 Bluetoothスピーカーなど出力先を固定する場合は `mpv --audio-device=help` で名前を
