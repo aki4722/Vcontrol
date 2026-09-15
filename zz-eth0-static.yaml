@@ -1,0 +1,18 @@
+network:
+  version: 2
+  ethernets:
+    eth0:
+      optional: true
+      dhcp4: false
+      dhcp6: true
+      addresses:
+        - 192.168.2.222/24
+      routes:
+        - to: default
+          via: 192.168.2.254
+      nameservers:
+        addresses:
+          - 192.168.2.254
+  wifis:
+    wlan0:
+      activation-mode: off

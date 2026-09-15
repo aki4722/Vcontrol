@@ -1,0 +1,19 @@
+[Unit]
+Description=Raspberry Pi recording and radio control
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=akimoto
+SupplementaryGroups=gpio i2c dialout
+WorkingDirectory=/home/akimoto/voice-control
+EnvironmentFile=-/home/akimoto/voice-control/.env
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=MPV_AUDIO_DEVICE=pipewire/bluez_output.9D:C6:55:EC:74:D5
+ExecStart=/home/akimoto/voice-control/venv/bin/python /home/akimoto/voice-control/listen.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
