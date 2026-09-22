@@ -1,3 +1,4 @@
 Flask>=3.1,<4
 gpiozero>=2,<3
 luma.oled>=3.14,<4
+evdev>=1.7,<2

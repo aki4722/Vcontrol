@@ -1,47 +1,68 @@
 #!/usr/bin/env python3
-"""GPIO と Web から録音・radiko を操作する常駐プロセス。"""
+"""キーボードと Web から録音・radiko を操作する常駐プロセス。"""
 
 import atexit
+import configparser
+import json
 import logging
 import os
 import queue
 import re
 import signal
+import select
 import shutil
 import subprocess
+import tempfile
 import threading
 import wave
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from flask import Flask, jsonify, render_template_string, request
-from gpiozero import DigitalInputDevice, DigitalOutputDevice, LED
+from gpiozero import LED
 
 BASE_DIR = Path(__file__).resolve().parent
-SAVE_DIR = Path(os.environ.get("RECORDINGS_DIR", "/home/akimoto/recordings"))
+SSD_MOUNT_POINT = Path(os.environ.get("SSD_MOUNT_POINT", "/mnt/ssd"))
+SAVE_DIR = Path(os.environ.get("RECORDINGS_DIR", str(SSD_MOUNT_POINT / "voice")))
+SSD_LOW_SPACE_GIB = 1.0
 STATIONS_FILE = BASE_DIR / "stations.conf"
+RADIO_STATION_FILE = BASE_DIR / "radio_station.txt"
 RADIO_SCRIPT = BASE_DIR / "play_radiko.sh"
+MP3_SCRIPT = BASE_DIR / "play_mp3.sh"
+MP3_NAME = "04-アクセル.mp3"
 GDRIVE_DIR = os.environ.get("GDRIVE_DIR", "gdrive:音声")
 SAMPLE_RATE = 16000
 CHANNELS = 1
 SPLIT_SECONDS = 3600
 RECORD_LED_GPIO = 27
-MATRIX_ROWS = (5, 6, 13)
-MATRIX_COLUMNS = (16, 20, 21)
-MATRIX_ACTIONS = ("record_toggle", "record_stop", "all_stop", 0, 1, 2, 3, 4, 5)
+KEYBOARD_DEVICE_NAME = "aki4722 akisan08"
 WEB_HOST = os.environ.get("WEB_HOST", "0.0.0.0")
 WEB_PORT = int(os.environ.get("WEB_PORT", "5000"))
 ALSA_VOLUME_CONTROL = "Master"
 OLED_PORT = int(os.environ.get("OLED_PORT", "1"), 0)
 OLED_ADDRESS = int(os.environ.get("OLED_ADDRESS", "0x3c"), 0)
 OLED_FONT = Path("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
+OLED_NAME_FONT = BASE_DIR / "assets/fonts/RoundedMplus1c-Regular.ttf"
 OLED_FONT_SIZE = 12
-OLED_FOOTER_FONT_SIZE = 10
+OLED_FOOTER_FONT_SIZE = 9
+SD_MOUNT_POINT = Path("/")
 CPU_TEMP_FILE = Path("/sys/class/thermal/thermal_zone0/temp")
 CPU_TEMP_UPDATE_SECONDS = 30
 STORAGE_UPDATE_SECONDS = 30
+SSD_PROBE_TIMEOUT_SECONDS = 2.0
 REC_BLINK_SECONDS = 0.5
+IR_RX_LED_GPIO = 22
+IR_TX_LED_GPIO = 10
+IR_RX_DEVICE = "/dev/lirc1"
+IR_TX_DEVICE = "/dev/lirc0"
+IR_CODES_FILE = BASE_DIR / "ir_codes.json"
+IR_LEARN_TIMEOUT_SECONDS = 30
+IR_SEND_TIMEOUT_SECONDS = 5
+IR_STATE_IDLE = "idle"
+IR_STATE_RECEIVING = "receiving"
+IR_STATE_TRANSMITTING = "transmitting"
 
 log = logging.getLogger(__name__)
 app = Flask(__name__)
@@ -49,6 +70,7 @@ control_lock = threading.RLock()
 upload_queue = queue.Queue()
 upload_lock = threading.Lock()
 upload_process = None
+upload_generation = 0
 upload_thread = None
 shutdown_event = threading.Event()
 record_process = None
@@ -59,39 +81,100 @@ recording_started_at = None
 radio_process = None
 radio_pgid = None
 radio_error = None
+keyboard_error = None
 current_station = None
 record_led = None
-matrix_rows = []
-matrix_columns = []
 cleanup_done = False
 oled_device = None
 oled_thread = None
 cpu_temperature_text = "CPU --c"
 cpu_temperature_updated_at = None
-storage_free_text = "FREE --G"
-storage_free_updated_at = None
+storage_status = {"mounted": False, "free_gib": None, "total_gib": None, "low": False}
+storage_status_updated_at = None
+sd_free_text = "SD --G"
+sd_free_updated_at = None
+ir_state = IR_STATE_IDLE
+ir_process = None
+ir_pgid = None
+ir_learn_generation = 0
+ir_learn_timer = None
+ir_error = None
+ir_rx_led = None
+ir_tx_led = None
 
 
 def load_stations():
+    config = configparser.ConfigParser(interpolation=None)
+    config.read_string(STATIONS_FILE.read_text(encoding="utf-8"))
     result = []
-    with STATIONS_FILE.open(encoding="utf-8") as file:
-        for line in file:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            name, separator, station_id = line.partition("|")
-            if not separator or not re.fullmatch(r"[A-Za-z0-9-]+", station_id):
-                raise ValueError(f"放送局設定が不正です: {line}")
-            result.append({"name": name.strip(), "id": station_id})
+    numbers = set()
+    for section in config.sections():
+        number = int(section)
+        if number <= 0 or number in numbers:
+            raise ValueError(f"局番号が不正または重複しています: {section}")
+        numbers.add(number)
+        item = config[section]
+        name = item.get("name", "").strip()
+        station_id = item.get("id", "").strip()
+        url = item.get("url", "").strip()
+        if not name or bool(station_id) == bool(url):
+            raise ValueError(f"局{number}: name と id または url を指定してください")
+        if station_id and not re.fullmatch(r"[A-Za-z0-9-]+", station_id):
+            raise ValueError(f"局{number}: radiko局IDが不正です")
+        if url and (urlsplit(url).scheme not in ("http", "https") or not urlsplit(url).netloc):
+            raise ValueError(f"局{number}: 配信URLが不正です")
+        result.append({"number": number, "name": name, "id": station_id or str(number),
+                       "url": url})
     return result
 
 
+def load_station_number():
+    try:
+        number = int(RADIO_STATION_FILE.read_text(encoding="utf-8").strip())
+        if any(station["number"] == number for station in stations):
+            return number
+    except (OSError, ValueError, UnicodeError):
+        pass
+    return 1
+
+
+def save_station_number(number):
+    temporary = RADIO_STATION_FILE.with_suffix(".tmp")
+    temporary.write_text(f"{number}\n", encoding="utf-8")
+    temporary.replace(RADIO_STATION_FILE)
+
+
 stations = load_stations()
+selected_station_number = load_station_number()
+
+
+def _load_ir_codes():
+    """起動時に一度だけ読み込む。存在しない・壊れている場合は空で開始する。"""
+    try:
+        data = json.loads(IR_CODES_FILE.read_text(encoding="utf-8"))
+        codes = {int(number): entry for number, entry in data.get("codes", {}).items()}
+        next_number = int(data.get("next_number", 1))
+        return codes, max(next_number, max(codes, default=0) + 1)
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return {}, 1
+
+
+def _save_ir_codes():
+    """radio_station.txtと同じ、.tmpへ書いてからPath.replace()する原子的更新。"""
+    data = {
+        "next_number": ir_next_number,
+        "codes": {str(number): entry for number, entry in ir_codes.items()},
+    }
+    temporary = IR_CODES_FILE.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(IR_CODES_FILE)
+
+
+ir_codes, ir_next_number = _load_ir_codes()
 
 
 def _oled_station_name(station):
-    """OLEDは英数字だけに統一し、放送局はradiko局IDで表示する。"""
-    return station["id"]
+    return station["name"]
 
 
 def _cpu_temperature_text():
@@ -108,18 +191,71 @@ def _cpu_temperature_text():
     return cpu_temperature_text
 
 
-def _storage_free_text():
-    """録音保存先の空き容量を30秒ごとに取得する。"""
-    global storage_free_text, storage_free_updated_at
+def _sd_free_text():
+    """microSD（システム用の/）の空き容量を30秒ごとに読み、OLED向けの短い文字列で返す。"""
+    global sd_free_text, sd_free_updated_at
     now = time.monotonic()
-    if storage_free_updated_at is None or now - storage_free_updated_at >= STORAGE_UPDATE_SECONDS:
+    if sd_free_updated_at is None or now - sd_free_updated_at >= STORAGE_UPDATE_SECONDS:
         try:
-            free_gib = shutil.disk_usage(SAVE_DIR).free / (1024 ** 3)
-            storage_free_text = f"FREE {free_gib:.0f}G"
+            free_gib = shutil.disk_usage(SD_MOUNT_POINT).free / (1024 ** 3)
+            sd_free_text = f"SD {free_gib:.0f}G"
         except OSError:
-            storage_free_text = "FREE --G"
-        storage_free_updated_at = now
-    return storage_free_text
+            sd_free_text = "SD --G"
+        sd_free_updated_at = now
+    return sd_free_text
+
+
+def _probe_ssd_write(timeout=SSD_PROBE_TIMEOUT_SECONDS):
+    """SAVE_DIR配下へ実際に小さなファイルを書き込めるか確認する。
+    マウント表には残っているがデバイスが切断された「幽霊マウント」はstatvfs（空き容量取得）
+    だけでは検知できず、古いキャッシュ値が返ることがあるため、実I/Oで確かめる。
+    デバイス切断直後はI/Oが長時間ブロックすることがあるので、別スレッド+タイムアウトで実行し、
+    時間内に完了しなければ失敗扱いにする（元スレッドの待ちはそこで打ち切り、探査スレッドは
+    OSのタイムアウト任せでそのまま終了させる）。"""
+    result = {}
+
+    def probe():
+        try:
+            SAVE_DIR.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=SAVE_DIR, prefix=".ssd_probe_"):
+                pass
+            result["ok"] = True
+        except OSError:
+            result["ok"] = False
+
+    thread = threading.Thread(target=probe, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    return result.get("ok", False)
+
+
+def _refresh_storage_status():
+    """SSDの実マウント状態・実I/O・空き容量を即時確認する（キャッシュを使わない）。"""
+    global storage_status, storage_status_updated_at
+    if not os.path.ismount(SSD_MOUNT_POINT) or not _probe_ssd_write():
+        storage_status = {"mounted": False, "free_gib": None, "total_gib": None, "low": False}
+    else:
+        try:
+            usage = shutil.disk_usage(SSD_MOUNT_POINT)
+            free_gib = usage.free / (1024 ** 3)
+            storage_status = {
+                "mounted": True,
+                "free_gib": free_gib,
+                "total_gib": usage.total / (1024 ** 3),
+                "low": free_gib < SSD_LOW_SPACE_GIB,
+            }
+        except OSError:
+            storage_status = {"mounted": False, "free_gib": None, "total_gib": None, "low": False}
+    storage_status_updated_at = time.monotonic()
+    return storage_status
+
+
+def _cached_storage_status():
+    """OLED表示向け。30秒ごとにのみ実ディスクを確認する。"""
+    now = time.monotonic()
+    if storage_status_updated_at is None or now - storage_status_updated_at >= STORAGE_UPDATE_SECONDS:
+        return _refresh_storage_status()
+    return storage_status
 
 
 def _oled_lines():
@@ -129,15 +265,18 @@ def _oled_lines():
         if radio_process is not None and radio_process.poll() is not None:
             _stop_radio_locked(unexpected=True)
         now = datetime.now()
+        if keyboard_error:
+            return (now.strftime("%Y-%m-%d %H:%M"), "CONFIG ERROR", keyboard_error, _cached_storage_status(), _cpu_temperature_text(), True, _sd_free_text())
         if record_process is not None:
             elapsed = max(0, int((now - recording_started_at).total_seconds()))
             hours, remainder = divmod(elapsed, 3600)
             minutes, seconds = divmod(remainder, 60)
             rec_visible = int(time.monotonic() / REC_BLINK_SECONDS) % 2 == 0
-            return (now.strftime("%Y-%m-%d %H:%M"), "REC", f"TIME {hours:02}:{minutes:02}:{seconds:02}", _storage_free_text(), _cpu_temperature_text(), rec_visible)
+            return (now.strftime("%Y-%m-%d %H:%M"), "RECORDING", f"TIME {hours:02}:{minutes:02}:{seconds:02}", _cached_storage_status(), _cpu_temperature_text(), rec_visible, _sd_free_text())
         if radio_process is not None:
-            return (now.strftime("%Y-%m-%d %H:%M"), "RADIO", _oled_station_name(current_station), _storage_free_text(), _cpu_temperature_text(), True)
-        return (now.strftime("%Y-%m-%d %H:%M"), "READY", "VOICE CONTROL", _storage_free_text(), _cpu_temperature_text(), True)
+            label = "MP3 LOOP" if current_station.get("kind") == "mp3" else "RADIO PLAYING"
+            return (now.strftime("%Y-%m-%d %H:%M"), label, _oled_station_name(current_station), _cached_storage_status(), _cpu_temperature_text(), True, _sd_free_text())
+        return (now.strftime("%Y-%m-%d %H:%M"), "STANDBY", "VOICE CONTROL", _cached_storage_status(), _cpu_temperature_text(), True, _sd_free_text())
 
 
 def oled_worker():
@@ -147,6 +286,7 @@ def oled_worker():
 
     # SSD1309のmode="1"キャンバスへ直接描画し、中間階調を作らない。
     oled_font = ImageFont.truetype(OLED_FONT, OLED_FONT_SIZE)
+    name_font = ImageFont.truetype(str(OLED_NAME_FONT), OLED_FONT_SIZE)
     footer_font = ImageFont.truetype(OLED_FONT, OLED_FOOTER_FONT_SIZE)
     previous = None
     try:
@@ -158,10 +298,23 @@ def oled_worker():
                     draw.line((2, 13, 125, 13), fill="white")
                     if lines[5]:
                         draw.text((2, 14), lines[1], font=oled_font, fill="white")
-                    draw.text((2, 31), lines[2][:18], font=oled_font, fill="white")
-                    draw.text((2, 52), lines[4], font=footer_font, fill="white")
-                    if lines[3]:
-                        draw.text((126, 52), lines[3], font=footer_font, fill="white", anchor="ra")
+                    text = lines[2]
+                    while text and draw.textbbox((0, 0), text, font=name_font)[2] > 124:
+                        text = text[:-1]
+                    draw.text((2, 31), text, font=name_font, fill="white")
+                    # フッターは2段：1段目にCPU温度とmicroSD空き、2段目に録音先SSDの空き/総容量。
+                    draw.text((2, 46), lines[4], font=footer_font, fill="white")
+                    draw.text((126, 46), lines[6], font=footer_font, fill="white", anchor="ra")
+                    storage = lines[3]
+                    if not storage["mounted"]:
+                        storage_text = "SSD: NOT MOUNTED"
+                    elif storage["low"]:
+                        storage_text = "SSD LOW SPACE"
+                    else:
+                        storage_text = f"SSD {storage['free_gib']:.1f}/{storage['total_gib']:.0f}GB"
+                        if draw.textbbox((0, 0), storage_text, font=footer_font)[2] > 124:
+                            storage_text = f"SSD {storage['free_gib']:.0f}GB"
+                    draw.text((2, 54), storage_text, font=footer_font, fill="white")
                 previous = lines
             shutdown_event.wait(0.5)
     except Exception:
@@ -171,13 +324,18 @@ def oled_worker():
 def upload_worker():
     global upload_process
     while True:
-        filepath = upload_queue.get()
+        item = upload_queue.get()
+        filepath = None
+        process = None
         try:
-            if filepath is None or shutdown_event.is_set():
+            if item is None or shutdown_event.is_set():
                 return
+            filepath, generation = item
             with upload_lock:
                 if shutdown_event.is_set():
                     return
+                if generation != upload_generation:
+                    continue
                 process = subprocess.Popen(
                     ["rclone", "copyto", str(filepath), f"{GDRIVE_DIR}/{filepath.name}"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -193,7 +351,7 @@ def upload_worker():
             log.exception("アップロード実行エラー: %s", filepath)
         finally:
             with upload_lock:
-                if upload_process is not None and upload_process.poll() is not None:
+                if process is not None and upload_process is process and process.poll() is not None:
                     upload_process = None
             upload_queue.task_done()
 
@@ -224,7 +382,9 @@ def _close_file(upload=True):
         current_filepath = None
         recording_started_at = None
     if upload and filepath:
-        upload_queue.put(filepath)
+        with upload_lock:
+            upload_queue.put((filepath, upload_generation))
+    _refresh_storage_status()
 
 
 def write_recording(process):
@@ -292,6 +452,7 @@ def _stop_radio_locked(unexpected=False):
     global radio_process, radio_pgid, radio_error, current_station
     process = radio_process
     pgid = radio_pgid
+    label = "MP3" if current_station and current_station.get("kind") == "mp3" else "ラジオ"
     radio_process = None
     radio_pgid = None
     current_station = None
@@ -304,11 +465,11 @@ def _stop_radio_locked(unexpected=False):
     else:
         output = ""
     if unexpected:
-        radio_error = output.splitlines()[-1] if output else "ラジオ再生プロセスが終了しました"
-        log.error("ラジオ異常終了: %s", radio_error)
+        radio_error = output.splitlines()[-1] if output else f"{label}再生プロセスが終了しました"
+        log.error("%s異常終了: %s", label, output or radio_error)
     else:
         radio_error = None
-    log.info("ラジオ停止")
+    log.info("%s停止", label)
     return True
 
 
@@ -317,31 +478,60 @@ def stop_radio():
         return _stop_radio_locked()
 
 
-def start_radio(station):
-    global radio_process, radio_pgid, radio_error, current_station
+def start_radio(station, toggle=True):
+    global radio_process, radio_pgid, radio_error, current_station, keyboard_error
+    global selected_station_number
+    is_mp3 = station.get("kind") == "mp3"
+    label = "MP3" if is_mp3 else "ラジオ"
     with control_lock:
+        keyboard_error = None
         if shutdown_event.is_set():
             return False, "終了処理中です"
         _reconcile_recording()
         if record_process is not None:
-            return False, "録音中はラジオを再生できません"
-        if radio_process is not None and radio_process.poll() is None:
-            return False, "ラジオはすでに再生中です"
+            return False, f"録音中は{label}を再生できません"
+        same_station = (radio_process is not None and radio_process.poll() is None
+                        and (current_station["id"], current_station.get("url"))
+                        == (station["id"], station.get("url")))
+        if same_station and not toggle:
+            return True, f"{label}再生中です"
         if radio_process is not None:
             _stop_radio_locked()
+        if same_station:
+            return True, "ラジオを停止しました"
         try:
+            command = [str(RADIO_SCRIPT), station["id"]]
+            if is_mp3:
+                command = ["bash", str(MP3_SCRIPT), f"{GDRIVE_DIR.rstrip('/')}/{MP3_NAME}"]
+            elif station.get("url"):
+                command = ["mpv", "--no-video", "--no-terminal", "--ytdl=no",
+                           "--cache=yes", "--cache-secs=30",
+                           "--audio-device=" + os.environ.get("MPV_AUDIO_DEVICE", "auto"),
+                           "--", station["url"]]
             radio_process = subprocess.Popen(
-                [str(RADIO_SCRIPT), station["id"]], start_new_session=True,
+                command, start_new_session=True,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             )
         except OSError as exc:
-            log.exception("ラジオ開始失敗")
+            log.exception("%s開始失敗", label)
             return False, str(exc)
         current_station = station
         radio_pgid = radio_process.pid
         radio_error = None
-        log.info("ラジオ開始: %s", station["name"])
-        return True, "ラジオ再生を開始しました"
+        if not is_mp3:
+            selected_station_number = station["number"]
+            try:
+                save_station_number(selected_station_number)
+            except OSError as exc:
+                radio_error = f"選局Noを保存できません: {exc}"
+                log.exception("選局No保存失敗")
+        log.info("%s開始: %s", label, station["name"])
+        return True, f"{label}再生を開始しました"
+
+
+def start_mp3():
+    return start_radio({"kind": "mp3", "id": "local-mp3-loop",
+                        "name": MP3_NAME}, toggle=False)
 
 
 def start_recording():
@@ -352,6 +542,13 @@ def start_recording():
         _reconcile_recording()
         if record_process is not None:
             return False, "すでに録音中です"
+        status = _refresh_storage_status()
+        if not status["mounted"]:
+            log.error("SSD (%s) が未マウントのため録音を開始できません", SSD_MOUNT_POINT)
+            return False, "SSDが接続されていないため録音を開始できません"
+        if status["low"]:
+            log.error("SSDの空き容量不足のため録音を開始できません（残り %.2fGB）", status["free_gib"])
+            return False, "SSDの空き容量が不足しているため録音を開始できません"
         _stop_radio_locked()
         try:
             SAVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -398,9 +595,24 @@ def stop_recording():
 
 
 def emergency_stop():
+    global upload_generation, radio_error, keyboard_error
     with control_lock:
         stop_recording()
         stop_radio()
+        # 録音writerの終了後に世代を進め、取り出し済みの待機ジョブも無効化する。
+        with upload_lock:
+            upload_generation += 1
+            while True:
+                try:
+                    upload_queue.get_nowait()
+                except queue.Empty:
+                    break
+                else:
+                    upload_queue.task_done()
+            if upload_process is not None:
+                _terminate_group(upload_process, upload_process.pid)
+        radio_error = None
+        keyboard_error = None
         if record_led is not None:
             record_led.off()
         log.info("強制停止")
@@ -413,6 +625,187 @@ def toggle_recording():
             start_recording()
         else:
             stop_recording()
+
+
+# ---- IR remote（学習・送信）----
+# GPIO4/GPIO18はdtoverlay=gpio-ir/gpio-ir-txがカーネルドライバとして専有するため、
+# アプリコードから直接触らず、必ず /dev/lirc1（受信）・/dev/lirc0（送信）を
+# ir-ctl経由で使う。GPIO22・GPIO10はステータスLED（gpiozero）専用。
+
+
+def start_ir_learning():
+    """IR学習を開始する。ボタン押下でir-ctlが自動終了するまでバックグラウンドで待つ。"""
+    global ir_process, ir_pgid, ir_state, ir_error, ir_learn_timer
+    with control_lock:
+        if shutdown_event.is_set():
+            return False, "終了処理中です"
+        if ir_state != IR_STATE_IDLE:
+            return False, "IR操作が競合しています"
+        try:
+            process = subprocess.Popen(
+                ["ir-ctl", "-d", IR_RX_DEVICE, "--receive", "--mode2", "--one-shot"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            log.exception("IR学習開始失敗")
+            return False, str(exc)
+        ir_process = process
+        ir_pgid = process.pid
+        ir_error = None
+        ir_state = IR_STATE_RECEIVING
+        ir_rx_led.on()
+        generation = ir_learn_generation
+        threading.Thread(target=_ir_learn_worker, args=(process, generation), daemon=True).start()
+        ir_learn_timer = threading.Timer(IR_LEARN_TIMEOUT_SECONDS, cancel_ir_learning)
+        ir_learn_timer.daemon = True
+        ir_learn_timer.start()
+        log.info("IR学習開始")
+        return True, "リモコンのボタンを押してください"
+
+
+def cancel_ir_learning():
+    """学習中なら ir-ctl を止めて保存せず待機へ戻す。戻り値は実際に取消したか。"""
+    global ir_process, ir_pgid, ir_state, ir_learn_generation, ir_learn_timer
+    with control_lock:
+        if ir_state != IR_STATE_RECEIVING:
+            return False
+        _terminate_group(ir_process, ir_pgid)
+        ir_process = None
+        ir_pgid = None
+        ir_learn_generation += 1
+        ir_state = IR_STATE_IDLE
+        ir_rx_led.off()
+        if ir_learn_timer is not None:
+            ir_learn_timer.cancel()
+            ir_learn_timer = None
+        log.info("IR学習キャンセル")
+        return True
+
+
+def _ir_learn_worker(process, generation):
+    """バックグラウンドスレッド。ir-ctlの終了をロック外でブロッキング待機してから確定する。"""
+    global ir_process, ir_pgid, ir_state, ir_error, ir_next_number, ir_learn_timer
+    try:
+        stdout, stderr = process.communicate()
+    except Exception:
+        log.exception("IR受信の待機に失敗しました")
+        stdout, stderr = b"", b""
+    with control_lock:
+        if generation != ir_learn_generation:
+            return  # キャンセル済み、またはこの結果はもう無効
+        ir_process = None
+        ir_pgid = None
+        if ir_learn_timer is not None:
+            ir_learn_timer.cancel()
+            ir_learn_timer = None
+        lines = [line.strip() for line in stdout.decode("utf-8", "replace").splitlines()]
+        signal_lines = [line for line in lines if re.fullmatch(r"(pulse|space) \d+", line)]
+        if process.returncode != 0 or len(signal_lines) < 2:
+            detail = stderr.decode("utf-8", "replace").strip().splitlines()
+            ir_error = detail[-1] if detail else "IR信号を受信できませんでした"
+            log.error("IR受信エラー: %s", ir_error)
+        else:
+            number = ir_next_number
+            ir_codes[number] = {
+                "name": f"リモコン{number}",
+                "created_at": datetime.now().astimezone().isoformat(),
+                "signal": signal_lines,
+            }
+            ir_next_number = number + 1
+            try:
+                _save_ir_codes()
+                ir_error = None
+                log.info("IR受信成功: IR No.%s を保存しました", number)
+            except OSError as exc:
+                del ir_codes[number]
+                ir_next_number = number
+                ir_error = f"IRデータを保存できません: {exc}"
+                log.exception("IRデータ保存失敗")
+        ir_state = IR_STATE_IDLE
+        ir_rx_led.off()
+
+
+def rename_ir_code(number, name):
+    """登録済みIRコードの名前を変更する。"""
+    with control_lock:
+        if number not in ir_codes:
+            return False, "指定したIR番号が見つかりません"
+        name = name.strip()
+        if not name:
+            return False, "名前を入力してください"
+        ir_codes[number]["name"] = name
+        try:
+            _save_ir_codes()
+        except OSError as exc:
+            return False, f"名前を保存できません: {exc}"
+        return True, "名前を変更しました"
+
+
+def send_ir(number):
+    """*** IR送信の唯一の共通処理 ***
+    Web UI・HTTP APIはこの関数を呼ぶだけにする。将来の物理ボタン・キーボード・
+    タイマー等から呼び出す場合も、この関数を直接呼び出せばよい。"""
+    global ir_state
+    with control_lock:
+        if shutdown_event.is_set():
+            return False, "終了処理中です"
+        if ir_state != IR_STATE_IDLE:
+            return False, "IR操作が競合しています"
+        if number not in ir_codes:
+            return False, "指定したIR番号が見つかりません"
+        signal_lines = ir_codes[number]["signal"]
+        ir_state = IR_STATE_TRANSMITTING
+        ir_tx_led.on()
+    log.info("IR送信開始: IR No.%s", number)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="ascii") as file:
+            file.write("\n".join(signal_lines) + "\n")
+            temp_path = file.name
+        process = subprocess.Popen(
+            ["ir-ctl", "-d", IR_TX_DEVICE, f"--send={temp_path}"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=IR_SEND_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            _terminate_group(process, process.pid)
+            stdout, stderr = process.communicate()
+        if process.returncode != 0:
+            detail = stderr.decode("utf-8", "replace").strip().splitlines()
+            message = detail[-1] if detail else "IR送信に失敗しました"
+            log.error("IR送信エラー: IR No.%s: %s", number, message)
+            return False, message
+        log.info("IR送信完了: IR No.%s", number)
+        return True, "IR送信を完了しました"
+    except OSError as exc:
+        log.exception("IR送信失敗")
+        return False, str(exc)
+    finally:
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+        with control_lock:
+            ir_state = IR_STATE_IDLE
+            ir_tx_led.off()
+
+
+def send_ir_sequence(numbers, gap_seconds=0.3):
+    """複数のIR番号を順番に送信する薄いヘルパー（将来の複数機器一括操作向け）。
+    1件失敗しても残りの送信は継続する。シーン管理・スケジューリングはここでは扱わない。"""
+    results = []
+    for index, number in enumerate(numbers):
+        ok, message = send_ir(number)
+        results.append((number, ok, message))
+        if index < len(numbers) - 1:
+            time.sleep(gap_seconds)
+    overall_ok = all(ok for _, ok, _ in results)
+    summary = "; ".join(f"No.{number}: {message}" for number, ok, message in results)
+    return overall_ok, summary
 
 
 def get_volume():
@@ -435,51 +828,144 @@ def get_status():
         started_at = recording_started_at
         if radio_process is not None and radio_process.poll() is not None:
             _stop_radio_locked(unexpected=True)
-        radio = radio_process is not None
+        playing = radio_process is not None
+        mp3 = playing and current_station.get("kind") == "mp3"
+        radio = playing and not mp3
         return {
             "recording": recording,
             "recording_file": filepath.name if filepath else None,
             "recording_seconds": max(0, int((datetime.now() - started_at).total_seconds())) if started_at else 0,
             "radio": radio,
+            "mp3": mp3,
+            "mp3_name": current_station["name"] if mp3 else None,
             "station": current_station["name"] if radio else None,
             "radio_error": radio_error,
             "volume": get_volume(),
+            "ir_state": ir_state,
+            "ir_error": ir_error,
+            "ir_codes": [{"number": number, "name": ir_codes[number]["name"]}
+                         for number in sorted(ir_codes)],
         }
 
 
 HTML = """<!doctype html>
 <html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>録音・ラジオ操作</title><style>
-body{font-family:system-ui,sans-serif;background:#111827;color:#f9fafb;margin:0;padding:20px}
-main{max-width:650px;margin:auto}.card{background:#1f2937;padding:20px;margin:16px 0;border-radius:14px}
-button{display:block;width:100%;padding:15px;margin:8px 0;border:0;border-radius:10px;color:white;font-size:18px;cursor:pointer}
-.start{background:#15803d}.stop{background:#b91c1c}.station{background:#1d4ed8}.emergency{background:#b45309}
-small{color:#d1d5db}input[type=range]{width:100%}
-</style></head><body><main><h1>録音・ラジオ操作</h1>
-<section class="card"><h2>状態</h2><p id="recordStatus">読み込み中</p><small id="recordDetail"></small><p id="radioStatus"></p></section>
-<section class="card"><h2>録音</h2><button class="start" onclick="postCommand('/api/record/start')">録音開始</button>
-<button class="stop" onclick="postCommand('/api/record/stop')">録音停止</button></section>
-<section class="card"><h2>ラジオ</h2>{% for station in stations %}
+<title>Vcon</title><style>
+:root{--bg:#0d0f0d;--panel:#1a1c1a;--line:#3a3f3a;--text:#c9d1c9;--dim:#7a827a;--amber:#f5a623;--green:#4caf50;--red:#e53935}
+*{box-sizing:border-box}
+body{font-family:'Courier New',ui-monospace,monospace;background:var(--bg);color:var(--text);margin:0;padding:16px 16px 96px}
+main{max-width:650px;margin:auto}
+h1{font-size:18px;letter-spacing:.12em;text-transform:uppercase;color:var(--amber);border-bottom:2px solid var(--amber);padding-bottom:10px;margin:4px 0 16px}
+h2{font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin:0 0 12px}
+.status-panel{border:2px solid var(--line);background:var(--panel);padding:14px 16px;margin-bottom:16px}
+.status-row{display:flex;align-items:center;gap:10px;padding:4px 0;font-size:14px}
+.status-row small{color:var(--dim);margin-left:20px;display:block;font-size:12px}
+.led{width:10px;height:10px;min-width:10px;border-radius:50%;background:#2a2e2a;border:1px solid var(--line)}
+.led.on{background:var(--green);border-color:var(--green);box-shadow:0 0 6px var(--green)}
+.led.error{background:var(--red);border-color:var(--red);box-shadow:0 0 6px var(--red)}
+.led.blink{animation:blink 1s steps(1,end) infinite}
+@keyframes blink{50%{opacity:.2}}
+.tabs{display:flex;border-bottom:2px solid var(--line)}
+.tab-btn{flex:1;background:#141614;color:var(--dim);border:2px solid var(--line);border-bottom:none;padding:10px 2px;
+font:inherit;font-weight:700;font-size:12px;letter-spacing:.08em;text-transform:uppercase;cursor:pointer}
+.tab-btn+.tab-btn{border-left:none}
+.tab-btn.active{background:var(--panel);color:var(--amber);border-color:var(--amber)}
+.tab-panel{border:2px solid var(--line);border-top:none;background:var(--panel);padding:20px}
+.tab-panel[hidden]{display:none}
+button{display:block;width:100%;padding:13px;margin:8px 0;border:2px solid var(--line);border-radius:2px;
+background:#141614;color:var(--text);font:inherit;font-weight:700;font-size:14px;letter-spacing:.06em;
+text-transform:uppercase;cursor:pointer}
+button:hover{filter:brightness(1.2)}
+.start{border-color:var(--green);color:var(--green)}
+.start:hover{background:var(--green);color:#0d0f0d}
+.stop{border-color:var(--red);color:var(--red)}
+.stop:hover{background:var(--red);color:#0d0f0d}
+.station{border-color:var(--amber);color:var(--amber)}
+.station:hover{background:var(--amber);color:#0d0f0d}
+label{display:block;font-size:12px;letter-spacing:.05em;color:var(--dim);text-transform:uppercase;margin-top:16px}
+input[type=range]{width:100%;accent-color:var(--amber)}
+table{width:100%;border-collapse:collapse;margin-top:8px}
+td{border:1px solid var(--line);padding:6px 8px;font-size:13px}
+input[type=text],table input{background:var(--bg);color:var(--text);border:1px solid var(--line);
+padding:6px;font:inherit;width:100%}
+.emergency-bar{position:fixed;left:0;right:0;bottom:0;padding:14px 16px;
+background:repeating-linear-gradient(45deg,#2a1010,#2a1010 12px,#160a0a 12px,#160a0a 24px);border-top:3px solid var(--red)}
+.emergency-bar button{border:2px solid var(--red);background:var(--red);color:#0d0f0d;font-weight:900;
+letter-spacing:.1em;max-width:650px;margin:0 auto}
+</style></head><body><main><h1>Vcon</h1>
+<section class="status-panel">
+<div class="status-row"><span class="led" id="ledRecord"></span><span id="recordStatus">読み込み中</span></div>
+<small id="recordDetail"></small>
+<div class="status-row"><span class="led" id="ledRadio"></span><span id="radioStatus"></span></div>
+<div class="status-row"><span class="led" id="ledIr"></span><span id="irStatus"></span></div>
+</section>
+<nav class="tabs">
+<button class="tab-btn" data-tab="record" onclick="showTab('record')">録音</button>
+<button class="tab-btn" data-tab="radio" onclick="showTab('radio')">ラジオ</button>
+<button class="tab-btn" data-tab="mp3" onclick="showTab('mp3')">MP3</button>
+<button class="tab-btn" data-tab="ir" onclick="showTab('ir')">IR</button>
+</nav>
+<div class="tab-panel" data-tab="record" hidden>
+<button class="start" onclick="postCommand('/api/record/start')">録音開始</button>
+<button class="stop" onclick="postCommand('/api/record/stop')">録音停止</button>
+</div>
+<div class="tab-panel" data-tab="radio" hidden>{% for station in stations %}
 <button class="station" onclick='startRadio({{ station.id|tojson }})'>{{ station.name }}</button>{% endfor %}
 <button class="stop" onclick="postCommand('/api/radio/stop')">ラジオ停止</button>
-<label for="volume">音量: <span id="volumeValue">--</span>%</label><input id="volume" type="range" min="0" max="100" onchange="setVolume(this.value)"></section>
-<section class="card"><button class="emergency" onclick="postCommand('/api/all/stop')">録音・ラジオをすべて停止</button></section>
+<label for="volume">音量: <span id="volumeValue">--</span>%</label>
+<input id="volume" type="range" min="0" max="100" onchange="setVolume(this.value)">
+</div>
+<div class="tab-panel" data-tab="mp3" hidden>
+<button class="start" onclick="postCommand('/api/mp3/start')">04-アクセル.mp3 を繰り返し再生</button>
+<button class="stop" onclick="postCommand('/api/mp3/stop')">MP3停止</button>
+</div>
+<div class="tab-panel" data-tab="ir" hidden>
+<button class="start" onclick="postCommand('/api/ir/learn/start')">IR録音開始</button>
+<button class="stop" onclick="postCommand('/api/ir/learn/stop')">IR録音停止</button>
+<table id="irCodes"></table>
+</div>
+</main>
+<div class="emergency-bar"><button onclick="postCommand('/api/all/stop')">緊急停止（録音・ラジオ・MP3）</button></div>
 <script>
 const byId=id=>document.getElementById(id);
+function showTab(name){
+document.querySelectorAll('.tab-panel').forEach(el=>{el.hidden=el.dataset.tab!==name;});
+document.querySelectorAll('.tab-btn').forEach(el=>{el.classList.toggle('active',el.dataset.tab===name);});
+}
+let lastIrCodesJson=null;
+function renameIr(number,name){postCommand('/api/ir/rename/'+number,{headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});}
+function renderIrCodes(codes){const json=JSON.stringify(codes);if(json===lastIrCodesJson)return;lastIrCodesJson=json;
+const table=byId('irCodes');table.innerHTML='';
+for(const c of codes){
+const row=document.createElement('tr');
+const numberCell=document.createElement('td');numberCell.textContent='No.'+c.number;
+const nameCell=document.createElement('td');const input=document.createElement('input');
+input.type='text';input.value=c.name;input.onchange=()=>renameIr(c.number,input.value);nameCell.appendChild(input);
+const sendCell=document.createElement('td');const button=document.createElement('button');
+button.className='station';button.textContent='送信';button.onclick=()=>postCommand('/api/ir/send/'+c.number);
+sendCell.appendChild(button);
+row.append(numberCell,nameCell,sendCell);table.appendChild(row);
+}}
+const IR_STATE_LABELS={idle:'IR待機中',receiving:'IR受信中…（リモコンのボタンを押してください）',transmitting:'IR送信中…'};
 async function updateStatus(){try{const response=await fetch('/api/status',{cache:'no-store'});const data=await response.json();
 byId('recordStatus').textContent=data.recording?'● 録音中':'録音停止';
 byId('recordDetail').textContent=data.recording?`${data.recording_file} / ${data.recording_seconds}秒`:'';
-byId('radioStatus').textContent=data.radio?`ラジオ再生中: ${data.station}`:(data.radio_error||'ラジオ停止');
+byId('ledRecord').className='led'+(data.recording?' on blink':'');
+byId('radioStatus').textContent=data.radio_error|| (data.mp3?`MP3ループ再生（取得中を含む）: ${data.mp3_name}`:data.radio?`ラジオ再生中: ${data.station}`:'ラジオ・MP3停止');
+byId('ledRadio').className='led'+(data.radio_error?' error':(data.radio||data.mp3)?' on':'');
 const slider=byId('volume');slider.disabled=data.recording||data.volume===null;
 if(document.activeElement!==slider&&data.volume!==null)slider.value=data.volume;
 byId('volumeValue').textContent=data.volume===null?'--':data.volume;
+byId('irStatus').textContent=data.ir_error||IR_STATE_LABELS[data.ir_state]||'';
+byId('ledIr').className='led'+(data.ir_error?' error':(data.ir_state&&data.ir_state!=='idle')?' on blink':'');
+renderIrCodes(data.ir_codes||[]);
 }catch(error){byId('recordStatus').textContent='状態を取得できません';}}
 async function postCommand(url,options={}){try{const response=await fetch(url,{method:'POST',...options});const data=await response.json();
 if(!data.ok)alert(data.message||'操作に失敗しました');await updateStatus();}catch(error){alert('サーバーと通信できません');}}
 function startRadio(id){postCommand('/api/radio/start/'+encodeURIComponent(id));}
 function setVolume(value){postCommand('/api/volume',{headers:{'Content-Type':'application/json'},body:JSON.stringify({volume:Number(value)})});}
-updateStatus();setInterval(updateStatus,1000);
-</script></main></body></html>"""
+showTab('record');updateStatus();setInterval(updateStatus,1000);
+</script></body></html>"""
 
 
 @app.get("/")
@@ -517,6 +1003,19 @@ def web_radio_stop():
     return jsonify(ok=True, stopped=stop_radio())
 
 
+@app.post("/api/mp3/start")
+def web_mp3_start():
+    ok, message = start_mp3()
+    return jsonify(ok=ok, message=message), 200 if ok else 409
+
+
+@app.post("/api/mp3/stop")
+def web_mp3_stop():
+    with control_lock:
+        stopped = stop_radio() if current_station and current_station.get("kind") == "mp3" else False
+        return jsonify(ok=True, stopped=stopped)
+
+
 @app.post("/api/all/stop")
 def web_all_stop():
     emergency_stop()
@@ -540,43 +1039,169 @@ def web_volume():
     return jsonify(ok=True, volume=get_volume())
 
 
-def handle_matrix_key(index):
-    action = MATRIX_ACTIONS[index]
-    if action == "record_toggle":
-        toggle_recording()
-    elif action == "record_stop":
-        stop_recording()
-    elif action == "all_stop":
-        emergency_stop()
-    elif action < len(stations):
-        start_radio(stations[action])
+@app.post("/api/ir/learn/start")
+def web_ir_learn_start():
+    ok, message = start_ir_learning()
+    return jsonify(ok=ok, message=message), 200 if ok else 409
 
 
-def scan_matrix():
-    # 行を一つずつ Low にして列を読み、押下が安定した時だけ操作する。
-    previous = [False] * 9
-    changed_at = [time.monotonic()] * 9
-    stable = [False] * 9
-    while not shutdown_event.is_set():
-        for row_index, row in enumerate(matrix_rows):
-            row.off()
-            time.sleep(0.001)
-            for column_index, column in enumerate(matrix_columns):
-                index = row_index * 3 + column_index
-                pressed = bool(column.value)
-                now = time.monotonic()
-                if pressed != previous[index]:
-                    previous[index] = pressed
-                    changed_at[index] = now
-                elif pressed != stable[index] and now - changed_at[index] >= 0.05:
-                    stable[index] = pressed
-                    if pressed:
+@app.post("/api/ir/learn/stop")
+def web_ir_learn_stop():
+    return jsonify(ok=True, cancelled=cancel_ir_learning())
+
+
+@app.post("/api/ir/send/<number>")
+def web_ir_send(number):
+    try:
+        code_number = int(number)
+    except ValueError:
+        return jsonify(ok=False, message="番号は整数で指定してください"), 400
+    ok, message = send_ir(code_number)
+    return jsonify(ok=ok, message=message), 200 if ok else 409
+
+
+@app.post("/api/ir/rename/<number>")
+def web_ir_rename(number):
+    try:
+        code_number = int(number)
+    except ValueError:
+        return jsonify(ok=False, message="番号は整数で指定してください"), 400
+    name = (request.get_json(silent=True) or {}).get("name", "")
+    ok, message = rename_ir_code(code_number, name)
+    return jsonify(ok=ok, message=message), 200 if ok else 400
+
+
+def handle_keyboard_key(number):
+    global stations, radio_error, keyboard_error
+    with control_lock:
+        if number in (1, 5):
+            keyboard_error = None
+            try:
+                configured_stations = sorted(load_stations(), key=lambda item: item["number"])
+                station_number = selected_station_number
+                playing = (radio_process is not None and radio_process.poll() is None
+                           and current_station.get("kind") != "mp3")
+                if playing:
+                    numbers = [item["number"] for item in configured_stations]
+                    if current_station["number"] in numbers:
+                        index = numbers.index(current_station["number"])
+                        station_number = numbers[(index + (1 if number == 1 else -1)) % len(numbers)]
+                    else:
+                        station_number = 1
+                elif not any(item["number"] == station_number for item in configured_stations):
+                    station_number = 1
+                station = next((item for item in configured_stations
+                                if item["number"] == station_number), None)
+                if station is None:
+                    keyboard_error = f"NO STATION {station_number}"
+                    raise ValueError(f"Ctrl+{number}: 局番号 {station_number} が存在しません")
+            except (OSError, ValueError, configparser.Error) as exc:
+                keyboard_error = keyboard_error or f"CTRL{number} CONFIG"
+                radio_error = str(exc)
+                log.error("キー割り当てエラー: %s", exc)
+                return
+            stations = configured_stations
+            keyboard_error = None
+            radio_error = None
+            start_radio(station, toggle=False)
+        elif number == 4:
+            keyboard_error = None
+            radio_error = None
+            toggle_recording()
+        elif number == 8:
+            emergency_stop()
+
+
+class KeyboardShortcuts:
+    """デバイスごとに押下状態を保持し、長押しのリピートを無視する。"""
+
+    def __init__(self, codes):
+        self.codes = codes
+        self.pressed = set()
+        self.sync_lost = False
+        self.numbers = {getattr(codes, f"KEY_{number}"): number for number in range(1, 9)}
+
+    def feed(self, event):
+        if event.type != self.codes.EV_KEY:
+            return
+        if event.value == 0:
+            self.pressed.discard(event.code)
+            return
+        if event.value != 1 or event.code in self.pressed:
+            return
+        self.pressed.add(event.code)
+        if self.pressed.intersection((self.codes.KEY_LEFTCTRL, self.codes.KEY_RIGHTCTRL)):
+            number = self.numbers.get(event.code)
+            if number is not None:
+                handle_keyboard_key(number)
+
+
+def keyboard_worker():
+    """evdevで直接読むため端末・Enter不要。抜き差しは1秒ごとに再検出する。"""
+    from evdev import InputDevice, ecodes, list_devices
+
+    devices = {}
+    retry_at = 0
+    warned = set()
+    try:
+        while not shutdown_event.is_set():
+            if time.monotonic() >= retry_at:
+                for path in list_devices():
+                    if path in devices:
+                        continue
+                    device = None
+                    try:
+                        device = InputDevice(path)
+                        if device.name != KEYBOARD_DEVICE_NAME:
+                            device.close()
+                            continue
+                        keys = device.capabilities().get(ecodes.EV_KEY, [])
+                        if ecodes.KEY_1 not in keys or not any(
+                            key in keys for key in (ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL)
+                        ):
+                            device.close()
+                            continue
+                        shortcuts = KeyboardShortcuts(ecodes)
+                        shortcuts.pressed.update(device.active_keys())
+                        devices[path] = (device, shortcuts)
+                        log.info("キーボード接続: %s (%s)", device.name, path)
+                    except OSError:
+                        if device is not None:
+                            device.close()
+                        if path not in warned:
+                            log.exception("キーボードを開けません: %s（input権限を確認）", path)
+                            warned.add(path)
+                if not devices and "missing" not in warned:
+                    log.warning("対象キーボード %r がありません。接続と/dev/inputの読み取り権限を確認してください", KEYBOARD_DEVICE_NAME)
+                    warned.add("missing")
+                retry_at = time.monotonic() + 1
+            if not devices:
+                shutdown_event.wait(0.5)
+                continue
+            ready, _, _ = select.select([item[0] for item in devices.values()], [], [], 0.1)
+            for device in ready:
+                shortcuts = devices[device.path][1]
+                try:
+                    for event in device.read():
+                        if event.type == ecodes.EV_SYN and event.code == ecodes.SYN_DROPPED:
+                            shortcuts.sync_lost = True
+                            continue
+                        if shortcuts.sync_lost:
+                            if event.type == ecodes.EV_SYN and event.code == ecodes.SYN_REPORT:
+                                shortcuts.pressed = set(device.active_keys())
+                                shortcuts.sync_lost = False
+                            continue
                         try:
-                            handle_matrix_key(index)
+                            shortcuts.feed(event)
                         except Exception:
-                            log.exception("ボタン操作に失敗しました: %s", index)
-            row.on()
-        shutdown_event.wait(0.01)
+                            log.exception("キーボード操作に失敗しました")
+                except OSError:
+                    devices.pop(device.path)
+                    device.close()
+                    log.info("キーボード切断: %s", device.path)
+    finally:
+        for device, _ in devices.values():
+            device.close()
 
 
 def cleanup():
@@ -587,7 +1212,7 @@ def cleanup():
             return
         cleanup_done = True
         shutdown_event.set()
-        for stop in (stop_recording, stop_radio):
+        for stop in (stop_recording, stop_radio, cancel_ir_learning):
             try:
                 stop()
             except Exception:
@@ -596,12 +1221,12 @@ def cleanup():
             process = upload_process
             if process is not None:
                 _terminate_group(process, process.pid)
-        if record_led is not None:
-            record_led.off()
-        for device in matrix_rows + matrix_columns:
-            device.close()
-        if record_led is not None:
-            record_led.close()
+        for led in (record_led, ir_rx_led, ir_tx_led):
+            if led is not None:
+                led.off()
+        for led in (record_led, ir_rx_led, ir_tx_led):
+            if led is not None:
+                led.close()
         if oled_device is not None:
             try:
                 oled_device.clear()
@@ -613,22 +1238,57 @@ def cleanup():
 atexit.register(cleanup)
 
 
+def configure_bluetooth_audio():
+    """起動時に一度だけ、接続済みのJQ-BTをSBC-XQへ切り替える。"""
+    try:
+        result = subprocess.run(
+            ["bluetoothctl", "info", "9D:C6:55:EC:74:D5"],
+            capture_output=True, text=True, check=True, timeout=3,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+        if not re.search(r"^\s*Connected:\s*yes\s*$", result.stdout, re.MULTILINE):
+            log.info("JQ-BT未接続: SBC-XQ切り替えをスキップ")
+            return
+        subprocess.run(
+            ["pactl", "set-card-profile", "bluez_card.9D_C6_55_EC_74_D5",
+             "a2dp-sink-sbc_xq"],
+            capture_output=True, text=True, check=True, timeout=3,
+        )
+        log.info("JQ-BT: SBC-XQプロファイルへ切り替えました")
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        log.warning("JQ-BTの接続確認またはSBC-XQ切り替えに失敗しました（起動は継続します）: %s", exc)
+
+
 def main():
-    global record_led, matrix_rows, matrix_columns, upload_thread, oled_device, oled_thread
+    global record_led, ir_rx_led, ir_tx_led, upload_thread, oled_device, oled_thread
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     def request_shutdown(signum, frame):
         log.info("終了シグナル: %s", signal.Signals(signum).name)
         shutdown_event.set()
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, request_shutdown)
+    # 依存不足をバックグラウンドスレッドだけの失敗にしない。
+    import evdev  # noqa: F401
+
     scanner = None
     server = None
     try:
+        configure_bluetooth_audio()
+        status = _refresh_storage_status()
+        if status["mounted"]:
+            try:
+                SAVE_DIR.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                log.exception("録音保存先ディレクトリを作成できません: %s", SAVE_DIR)
+        else:
+            log.error("SSD (%s) が未マウントです。録音保存先 %s は作成しません", SSD_MOUNT_POINT, SAVE_DIR)
         record_led = LED(RECORD_LED_GPIO)
         record_led.off()
-        matrix_rows = [DigitalOutputDevice(pin, initial_value=True) for pin in MATRIX_ROWS]
-        matrix_columns = [DigitalInputDevice(pin, pull_up=True) for pin in MATRIX_COLUMNS]
-        scanner = threading.Thread(target=scan_matrix, daemon=True)
+        ir_rx_led = LED(IR_RX_LED_GPIO)
+        ir_tx_led = LED(IR_TX_LED_GPIO)
+        ir_rx_led.off()
+        ir_tx_led.off()
+        scanner = threading.Thread(target=keyboard_worker, daemon=True)
         scanner.start()
         upload_thread = threading.Thread(target=upload_worker, daemon=True)
         upload_thread.start()
