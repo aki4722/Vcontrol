@@ -153,8 +153,10 @@ same atomic `.tmp`-then-`Path.replace()` write pattern as `save_station_number`.
   audio dropouts ("息継ぎ") during Bluetooth (JQ-BT) playback, almost certainly EMI from
   the IR board's circuitry. This is why `configure_bluetooth_audio()` defaults to
   standard `a2dp-sink` (SBC) rather than the higher-bitrate `a2dp-sink-sbc_xq` — see
-  below. If dongle/IR-board separation is confirmed to fully resolve the dropouts,
-  switching back to `a2dp-sink-sbc_xq` for better quality becomes viable again.
+  below. Update: after switching the Pi from wired LAN (eth0) to Wi-Fi (wlan0), standard
+  SBC no longer drops out even with the IR board close to the dongle (so the wired LAN
+  was likely part of the cause) — but `a2dp-sink-sbc_xq` was retried on Wi-Fi and still
+  wasn't acceptable, so keep standard `a2dp-sink`.
 - **librespot doesn't survive network path changes**: its Spotify dealer websocket is
   long-lived and bound to whichever interface was active; unplugging eth0 leaves it dead
   (`Websocket peer does not respond`) while the process keeps running, so the `Vcon`
