@@ -147,6 +147,21 @@ same atomic `.tmp`-then-`Path.replace()` write pattern as `save_station_number`.
   `gpiozero.LED` pattern as GPIO27, distinct purpose — don't conflate them). `/dev/lirc*`
   are `root:video` (fixed OS udev rule), so both the systemd service
   (`SupplementaryGroups=`) and any manual-run user need the `video` group.
+- **Known EMI issue**: keep the external USB Bluetooth dongle (TP-Link UB500,
+  Realtek RTL8761B, on `hci0` — this Pi has no onboard Bluetooth) physically far from
+  the IR add-on board. Confirmed by testing: proximity between them causes random brief
+  audio dropouts ("息継ぎ") during Bluetooth (JQ-BT) playback, almost certainly EMI from
+  the IR board's circuitry. This is why `configure_bluetooth_audio()` defaults to
+  standard `a2dp-sink` (SBC) rather than the higher-bitrate `a2dp-sink-sbc_xq` — see
+  below. If dongle/IR-board separation is confirmed to fully resolve the dropouts,
+  switching back to `a2dp-sink-sbc_xq` for better quality becomes viable again.
+- **librespot doesn't survive network path changes**: its Spotify dealer websocket is
+  long-lived and bound to whichever interface was active; unplugging eth0 leaves it dead
+  (`Websocket peer does not respond`) while the process keeps running, so the `Vcon`
+  device vanishes from the Spotify API. Radio/MP3 are unaffected (fresh connections per
+  play). `librespot-netchange.sh` is a networkd-dispatcher hook (installed into
+  `no-carrier.d/` and `routable.d/`, see README) that restarts `librespot.service` on
+  eth0 changes.
 - OLED is a 128x64 SSD1309 over I2C (SDA=GPIO2/pin3, SCL=GPIO3/pin5), addressed via
   `luma.oled`; bus/address configurable through `.env` (`OLED_PORT`, `OLED_ADDRESS`).
   Station names render with the bundled `assets/fonts/RoundedMplus1c-Regular.ttf`
