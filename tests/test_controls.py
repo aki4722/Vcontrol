@@ -83,7 +83,7 @@ class ControlsTest(unittest.TestCase):
                 if connected:
                     self.assertEqual(run.call_args.args[0], [
                         'pactl', 'set-card-profile', 'bluez_card.9D_C6_55_EC_74_D5',
-                        'a2dp-sink-sbc_xq'])
+                        'a2dp-sink'])
                 for call in run.call_args_list:
                     self.assertEqual(call.kwargs['timeout'], 3)
                     self.assertTrue(call.kwargs['check'])

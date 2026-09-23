@@ -101,9 +101,13 @@ writes it into hourly-rotated WAV files (`SPLIT_SECONDS = 3600`) under
 
 **Bluetooth**: `configure_bluetooth_audio()` runs once at startup only — checks whether
 the fixed JQ-BT speaker MAC is already connected and if so switches its PipeWire profile
-to `a2dp-sink-sbc_xq` for better quality. No reconnection/retry logic lives in `listen.py`
-itself; `connect-jqbt.sh` is a separate, not-invoked-by-the-service script for manually
-reconnecting/re-pairing the speaker and re-pointing the PipeWire default sink.
+to `a2dp-sink` (standard SBC). It deliberately does *not* use `a2dp-sink-sbc_xq`
+(higher-bitrate SBC): with this Pi's external USB Bluetooth dongle (TP-Link UB500,
+Realtek RTL8761B), SBC-XQ caused random brief audio dropouts during Spotify playback;
+standard SBC trades a little quality for stability. No reconnection/retry logic lives in
+`listen.py` itself; `connect-jqbt.sh` is a separate, not-invoked-by-the-service script
+for manually reconnecting/re-pairing the speaker and re-pointing the PipeWire default
+sink.
 
 **Errors surface in two places that must stay in sync**: `radio_error` (playback/process
 failures) and `keyboard_error` (bad `stations.conf` / missing station number) are both

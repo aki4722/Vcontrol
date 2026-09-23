@@ -1696,7 +1696,10 @@ atexit.register(cleanup)
 
 
 def configure_bluetooth_audio():
-    """起動時に一度だけ、接続済みのJQ-BTをSBC-XQへ切り替える。"""
+    """起動時に一度だけ、接続済みのJQ-BTを標準SBCへ切り替える。
+    外付けUSB Bluetoothドングル（TP-Link UB500、Realtek RTL8761B）+ SBC-XQ（高ビットレート）
+    の組み合わせでは、Spotify再生中にランダムな瞬断（無音）が発生することを確認済みのため、
+    安定性を優先してSBC-XQは使用しない。"""
     try:
         result = subprocess.run(
             ["bluetoothctl", "info", "9D:C6:55:EC:74:D5"],
@@ -1704,16 +1707,16 @@ def configure_bluetooth_audio():
             env={**os.environ, "LC_ALL": "C"},
         )
         if not re.search(r"^\s*Connected:\s*yes\s*$", result.stdout, re.MULTILINE):
-            log.info("JQ-BT未接続: SBC-XQ切り替えをスキップ")
+            log.info("JQ-BT未接続: SBCプロファイル切り替えをスキップ")
             return
         subprocess.run(
             ["pactl", "set-card-profile", "bluez_card.9D_C6_55_EC_74_D5",
-             "a2dp-sink-sbc_xq"],
+             "a2dp-sink"],
             capture_output=True, text=True, check=True, timeout=3,
         )
-        log.info("JQ-BT: SBC-XQプロファイルへ切り替えました")
+        log.info("JQ-BT: SBCプロファイルへ切り替えました")
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        log.warning("JQ-BTの接続確認またはSBC-XQ切り替えに失敗しました（起動は継続します）: %s", exc)
+        log.warning("JQ-BTの接続確認またはSBCプロファイル切り替えに失敗しました（起動は継続します）: %s", exc)
 
 
 def main():

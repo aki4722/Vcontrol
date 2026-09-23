@@ -273,8 +273,15 @@ Bluetoothスピーカーなど出力先を固定する場合は `mpv --audio-dev
 接続済みの場合だけ次のコマンドを実行します。
 
 ```sh
-pactl set-card-profile bluez_card.9D_C6_55_EC_74_D5 a2dp-sink-sbc_xq
+pactl set-card-profile bluez_card.9D_C6_55_EC_74_D5 a2dp-sink
 ```
+
+標準SBCを使用します。高ビットレートの `a2dp-sink-sbc_xq` は音質は良いものの、
+このPiの外付けUSB Bluetoothドングル（TP-Link UB500、Realtek RTL8761B）との組み合わせで
+Spotify再生中にランダムな瞬断（無音）が発生することを確認したため、安定性を優先して
+使用していません。音質より安定性を優先しない場合は上記コマンドの引数を
+`a2dp-sink-sbc_xq` に変更してください（`listen.py`の`configure_bluetooth_audio()`も
+合わせて変更が必要です）。
 
 未接続時はスキップします。コマンドがない場合やプロファイル切り替え失敗時も、
 ログを残して録音・ラジオ・GPIO機能の起動を継続します。
