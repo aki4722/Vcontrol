@@ -163,7 +163,7 @@ same atomic `.tmp`-then-`Path.replace()` write pattern as `save_station_number`.
   device vanishes from the Spotify API. Radio/MP3 are unaffected (fresh connections per
   play). `librespot-netchange.sh` is a networkd-dispatcher hook (installed into
   `no-carrier.d/` and `routable.d/`, see README) that restarts `librespot.service` on
-  eth0 changes.
+  eth0 or wlan0 changes (a Wi-Fi reconnect kills the websocket the same way).
 - OLED is a 128x64 SSD1309 over I2C (SDA=GPIO2/pin3, SCL=GPIO3/pin5), addressed via
   `luma.oled`; bus/address configurable through `.env` (`OLED_PORT`, `OLED_ADDRESS`).
   Station names render with the bundled `assets/fonts/RoundedMplus1c-Regular.ttf`

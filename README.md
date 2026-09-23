@@ -122,12 +122,12 @@ Connect対応デバイス）が行い、`listen.py`はSpotify Web API経由で�
 5. ビルドしたバイナリを `sudo install -m 755 librespot /usr/local/bin/librespot` で配置し、
    `sudo cp librespot.service /etc/systemd/system/ && sudo systemctl daemon-reload &&
    sudo systemctl enable --now librespot.service` で常駐化します。
-6. 有線LAN(eth0)の抜き差しでlibrespotの接続が切れたまま戻らない（Spotifyから`Vcon`が
+6. 有線LAN(eth0)の抜き差しやWi-Fi(wlan0)の切断・再接続でlibrespotの接続が切れたまま戻らない（Spotifyから`Vcon`が
    見えなくなり「再生デバイス「Vcon」が見つかりません」になる。ラジオは影響なし）のを防ぐため、
    `librespot-netchange.sh` をnetworkd-dispatcherのフックとして配置します:
    `sudo install -m 755 librespot-netchange.sh /etc/networkd-dispatcher/no-carrier.d/50-restart-librespot &&
    sudo install -m 755 librespot-netchange.sh /etc/networkd-dispatcher/routable.d/50-restart-librespot`
-   （抜いたとき・挿したときにlibrespotを再起動。再生中だった場合は止まるのでCtrl+2で再開）。
+   （eth0/wlan0が切れたとき・つながったときにlibrespotを再起動。再生中だった場合は止まるのでCtrl+2で再開）。
 
 ### 再生リストの登録
 
