@@ -22,6 +22,7 @@ from urllib.parse import urlsplit
 
 from flask import Flask, jsonify, render_template_string, request
 from gpiozero import LED
+import requests
 
 BASE_DIR = Path(__file__).resolve().parent
 SSD_MOUNT_POINT = Path(os.environ.get("SSD_MOUNT_POINT", "/mnt/ssd"))
@@ -63,6 +64,18 @@ IR_SEND_TIMEOUT_SECONDS = 5
 IR_STATE_IDLE = "idle"
 IR_STATE_RECEIVING = "receiving"
 IR_STATE_TRANSMITTING = "transmitting"
+SPOTIFY_SOURCES_FILE = BASE_DIR / "spotify_sources.json"
+SPOTIFY_SELECTION_FILE = BASE_DIR / "spotify_selection.json"
+SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "")
+SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
+SPOTIFY_REFRESH_TOKEN = os.environ.get("SPOTIFY_REFRESH_TOKEN", "")
+SPOTIFY_DEVICE_NAME = os.environ.get("SPOTIFY_DEVICE_NAME", "Vcon")
+SPOTIFY_API_BASE = "https://api.spotify.com/v1"
+SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
+SPOTIFY_REQUEST_TIMEOUT_SECONDS = 10
+SPOTIFY_POLL_SECONDS = 5
+SPOTIFY_TOKEN_REFRESH_MARGIN_SECONDS = 60
+SPOTIFY_STOP_TIMEOUT_SECONDS = 3
 
 log = logging.getLogger(__name__)
 app = Flask(__name__)
@@ -87,6 +100,7 @@ record_led = None
 cleanup_done = False
 oled_device = None
 oled_thread = None
+spotify_poll_thread = None
 cpu_temperature_text = "CPU --c"
 cpu_temperature_updated_at = None
 storage_status = {"mounted": False, "free_gib": None, "total_gib": None, "low": False}
@@ -101,6 +115,15 @@ ir_learn_timer = None
 ir_error = None
 ir_rx_led = None
 ir_tx_led = None
+spotify_sources = []
+spotify_current_source = None
+spotify_now_playing = None
+spotify_error = None
+spotify_generation = 0
+spotify_access_token = None
+spotify_token_expiry = 0.0
+spotify_device_id = None
+spotify_configured_warned = False
 
 
 def load_stations():
@@ -171,6 +194,60 @@ def _save_ir_codes():
 
 
 ir_codes, ir_next_number = _load_ir_codes()
+
+
+def load_spotify_sources():
+    """spotify_sources.jsonを読む。未作成ならプレイリスト・アーティストとも未登録として空で始める。
+    存在するが壊れている場合はload_stations()と同様に例外を投げて呼び出し元に判断させる。"""
+    if not SPOTIFY_SOURCES_FILE.exists():
+        return []
+    data = json.loads(SPOTIFY_SOURCES_FILE.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("spotify_sources.jsonの形式が不正です（配列である必要があります）")
+    result = []
+    for index, item in enumerate(data):
+        kind = item.get("type")
+        name = (item.get("name") or "").strip()
+        spotify_id = (item.get("spotify_id") or "").strip()
+        if kind not in ("playlist", "artist") or not name or not spotify_id:
+            raise ValueError(f"spotify_sources.json[{index}]: type/name/spotify_idを確認してください")
+        result.append({"number": index + 1, "type": kind, "name": name, "spotify_id": spotify_id})
+    return result
+
+
+def _save_spotify_sources(sources):
+    """radio_station.txtと同じ、.tmpへ書いてからPath.replace()する原子的更新。"""
+    data = [{"type": item["type"], "name": item["name"], "spotify_id": item["spotify_id"]}
+            for item in sources]
+    temporary = SPOTIFY_SOURCES_FILE.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(SPOTIFY_SOURCES_FILE)
+
+
+def _load_spotify_selection():
+    try:
+        data = json.loads(SPOTIFY_SELECTION_FILE.read_text(encoding="utf-8"))
+        spotify_id = data.get("spotify_id")
+        if isinstance(spotify_id, str) and spotify_id:
+            return spotify_id
+    except (OSError, ValueError, AttributeError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def _save_spotify_selection(source):
+    temporary = SPOTIFY_SELECTION_FILE.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps({"spotify_id": source["spotify_id"], "type": source["type"]},
+                                     ensure_ascii=False), encoding="utf-8")
+    temporary.replace(SPOTIFY_SELECTION_FILE)
+
+
+try:
+    spotify_sources = load_spotify_sources()
+except (OSError, ValueError, json.JSONDecodeError) as exc:
+    spotify_sources = []
+    spotify_error = f"spotify_sources.json: {exc}"
+    log.error("Spotify再生リスト読み込み失敗: %s", exc)
 
 
 def _oled_station_name(station):
@@ -276,6 +353,15 @@ def _oled_lines():
         if radio_process is not None:
             label = "MP3 LOOP" if current_station.get("kind") == "mp3" else "RADIO PLAYING"
             return (now.strftime("%Y-%m-%d %H:%M"), label, _oled_station_name(current_station), _cached_storage_status(), _cpu_temperature_text(), True, _sd_free_text())
+        if spotify_current_source is not None:
+            index = spotify_current_source.get("number", "?")
+            total = len(spotify_sources)
+            label = f"SPOTIFY {index}/{total}"
+            if spotify_now_playing:
+                detail = f"{spotify_now_playing['track']} - {spotify_now_playing['artist']}"
+            else:
+                detail = spotify_current_source["name"]
+            return (now.strftime("%Y-%m-%d %H:%M"), label, detail, _cached_storage_status(), _cpu_temperature_text(), True, _sd_free_text())
         return (now.strftime("%Y-%m-%d %H:%M"), "STANDBY", "VOICE CONTROL", _cached_storage_status(), _cpu_temperature_text(), True, _sd_free_text())
 
 
@@ -490,6 +576,8 @@ def start_radio(station, toggle=True):
         _reconcile_recording()
         if record_process is not None:
             return False, f"録音中は{label}を再生できません"
+        if spotify_current_source is not None:
+            stop_spotify()
         same_station = (radio_process is not None and radio_process.poll() is None
                         and (current_station["id"], current_station.get("url"))
                         == (station["id"], station.get("url")))
@@ -550,6 +638,7 @@ def start_recording():
             log.error("SSDの空き容量不足のため録音を開始できません（残り %.2fGB）", status["free_gib"])
             return False, "SSDの空き容量が不足しているため録音を開始できません"
         _stop_radio_locked()
+        stop_spotify()
         try:
             SAVE_DIR.mkdir(parents=True, exist_ok=True)
             _open_file()
@@ -599,6 +688,7 @@ def emergency_stop():
     with control_lock:
         stop_recording()
         stop_radio()
+        stop_spotify(wait=True)
         # 録音writerの終了後に世代を進め、取り出し済みの待機ジョブも無効化する。
         with upload_lock:
             upload_generation += 1
@@ -808,6 +898,239 @@ def send_ir_sequence(numbers, gap_seconds=0.3):
     return overall_ok, summary
 
 
+# ---- Spotify（Web API再生制御）----
+# 実際の音声出力は別systemdサービスのlibrespot（Spotify Connectデバイス、voice-control外）が
+# 常時待受けして行う。ここではWeb API経由でそのデバイスへ再生を指示するだけで、librespot
+# プロセス自体の起動・停止は一切行わない。
+
+
+class SpotifyAPIError(Exception):
+    """Spotify Web API呼び出しの失敗（認証・通信・4xx/5xxいずれも含む）をひとまとめにする。
+    voice-control全体を落とさないよう、呼び出し側は必ず捕まえてspotify_errorへ格納すること。"""
+
+
+def _spotify_configured():
+    global spotify_configured_warned
+    if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET and SPOTIFY_REFRESH_TOKEN:
+        return True
+    if not spotify_configured_warned:
+        log.warning("Spotify未設定のため機能を無効化します（.envにSPOTIFY_CLIENT_ID/SECRET/REFRESH_TOKENが必要）")
+        spotify_configured_warned = True
+    return False
+
+
+def _spotify_ensure_token():
+    """アクセストークンが無い・期限間近ならrefresh_tokenで再取得する。control_lockの外で呼ぶこと。"""
+    global spotify_access_token, spotify_token_expiry
+    if spotify_access_token and time.monotonic() < spotify_token_expiry - SPOTIFY_TOKEN_REFRESH_MARGIN_SECONDS:
+        return spotify_access_token
+    try:
+        response = requests.post(
+            SPOTIFY_TOKEN_URL,
+            data={"grant_type": "refresh_token", "refresh_token": SPOTIFY_REFRESH_TOKEN},
+            auth=(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET),
+            timeout=SPOTIFY_REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise SpotifyAPIError(f"アクセストークン更新に失敗しました: {exc}") from exc
+    token = payload.get("access_token")
+    if not token:
+        raise SpotifyAPIError("アクセストークン更新の応答が不正です")
+    spotify_access_token = token
+    spotify_token_expiry = time.monotonic() + payload.get("expires_in", 3600)
+    return token
+
+
+def _spotify_request(method, path, params=None, json_body=None, retry_on_unauthorized=True):
+    """control_lockの外で呼ぶこと（ネットワークI/O）。失敗は必ずSpotifyAPIErrorに変換する。"""
+    global spotify_access_token
+    token = _spotify_ensure_token()
+    try:
+        response = requests.request(
+            method, f"{SPOTIFY_API_BASE}{path}",
+            headers={"Authorization": f"Bearer {token}"},
+            params=params, json=json_body,
+            timeout=SPOTIFY_REQUEST_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        raise SpotifyAPIError(f"Spotify通信エラー: {exc}") from exc
+    if response.status_code == 401 and retry_on_unauthorized:
+        spotify_access_token = None
+        return _spotify_request(method, path, params=params, json_body=json_body,
+                                 retry_on_unauthorized=False)
+    if response.status_code >= 400:
+        message = None
+        try:
+            message = response.json().get("error", {}).get("message")
+        except ValueError:
+            pass
+        raise SpotifyAPIError(message or f"Spotify APIエラー: HTTP {response.status_code}")
+    if not response.content:
+        return None
+    try:
+        return response.json()
+    except ValueError:
+        return None
+
+
+def _spotify_find_device_id(force=False):
+    global spotify_device_id
+    if spotify_device_id and not force:
+        return spotify_device_id
+    data = _spotify_request("GET", "/me/player/devices") or {}
+    for device in data.get("devices", []):
+        if device.get("name") == SPOTIFY_DEVICE_NAME:
+            spotify_device_id = device.get("id")
+            return spotify_device_id
+    raise SpotifyAPIError(f"Spotify再生デバイス「{SPOTIFY_DEVICE_NAME}」が見つかりません（librespotが起動・ペアリング済みか確認してください）")
+
+
+def _spotify_context_uri(source):
+    return f"spotify:{source['type']}:{source['spotify_id']}"
+
+
+def _spotify_play_worker(source, generation):
+    """control_lockの外でSpotify Web APIを呼ぶバックグラウンドスレッド（_ir_learn_workerと同じ形）。
+    generationが古くなっていたら（キャンセル・別の選局で上書き済み）結果を捨てる。"""
+    global spotify_current_source, spotify_error, spotify_now_playing
+    try:
+        try:
+            device_id = _spotify_find_device_id()
+            _spotify_request("PUT", "/me/player/play", params={"device_id": device_id},
+                              json_body={"context_uri": _spotify_context_uri(source)})
+        except SpotifyAPIError:
+            # デバイスIDが古くなっている可能性があるので一度だけ再検出して再試行する。
+            device_id = _spotify_find_device_id(force=True)
+            _spotify_request("PUT", "/me/player/play", params={"device_id": device_id},
+                              json_body={"context_uri": _spotify_context_uri(source)})
+        _spotify_request("PUT", "/me/player/shuffle", params={"device_id": device_id, "state": "true"})
+        log.info("[Spotify] Start %s: %s", source["type"], source["name"])
+        log.info("[Spotify] Shuffle ON")
+    except SpotifyAPIError as exc:
+        with control_lock:
+            if generation == spotify_generation:
+                spotify_error = str(exc)
+        log.error("[Spotify] 再生開始失敗: %s", exc)
+        return
+    with control_lock:
+        if generation != spotify_generation:
+            return
+        spotify_current_source = source
+        spotify_error = None
+        spotify_now_playing = None
+    try:
+        _save_spotify_selection(source)
+    except OSError as exc:
+        log.exception("Spotify選択状態を保存できません: %s", exc)
+
+
+def start_spotify(source):
+    """公開エントリ（キーボード・Web UI共通）。HTTP通信はcontrol_lockの外の別スレッドで行う。"""
+    global spotify_generation, spotify_error
+    with control_lock:
+        if shutdown_event.is_set():
+            return False, "終了処理中です"
+        if not _spotify_configured():
+            return False, "Spotifyが設定されていません"
+        _reconcile_recording()
+        if record_process is not None:
+            return False, "録音中はSpotifyを再生できません"
+        if radio_process is not None:
+            _stop_radio_locked()
+            log.info("[Radio] Stop because Spotify started")
+        spotify_generation += 1
+        generation = spotify_generation
+        spotify_error = None
+        threading.Thread(target=_spotify_play_worker, args=(source, generation), daemon=True).start()
+        return True, "Spotify再生を開始しました"
+
+
+def _spotify_pause_best_effort():
+    try:
+        _spotify_request("PUT", "/me/player/pause",
+                          params={"device_id": spotify_device_id} if spotify_device_id else None)
+        log.info("[Spotify] Stop")
+    except SpotifyAPIError as exc:
+        log.warning("[Spotify] 一時停止に失敗しました（無視して継続）: %s", exc)
+
+
+def stop_spotify(wait=False):
+    """ローカル状態は即クリアし、実際のpause呼び出しは別スレッドでベストエフォート実行する
+    （control_lockを長時間占有しないため）。wait=Trueの場合のみ（緊急停止用）短いタイムアウト
+    付きで完了を待つ。"""
+    global spotify_current_source, spotify_now_playing, spotify_generation
+    with control_lock:
+        if spotify_current_source is None:
+            return False
+        spotify_current_source = None
+        spotify_now_playing = None
+        spotify_generation += 1
+    if not _spotify_configured():
+        return True
+    thread = threading.Thread(target=_spotify_pause_best_effort, daemon=True)
+    thread.start()
+    if wait:
+        thread.join(SPOTIFY_STOP_TIMEOUT_SECONDS)
+    return True
+
+
+def spotify_search_artists(query):
+    """アーティスト検索。呼び出し元（Flaskルート）でSpotifyAPIErrorを捕まえる。"""
+    data = _spotify_request("GET", "/search", params={"q": query, "type": "artist", "limit": 10})
+    items = (data or {}).get("artists", {}).get("items", [])
+    return [{"name": item.get("name"), "spotify_id": item.get("id")} for item in items
+            if item.get("name") and item.get("id")]
+
+
+def add_spotify_artist(name, spotify_id):
+    """検索結果から選ばれたアーティストをspotify_sources.jsonへ追記する（重複はしない）。"""
+    global spotify_sources
+    with control_lock:
+        for item in spotify_sources:
+            if item["type"] == "artist" and item["spotify_id"] == spotify_id:
+                return item
+        updated = spotify_sources + [{"number": len(spotify_sources) + 1, "type": "artist",
+                                       "name": name, "spotify_id": spotify_id}]
+        _save_spotify_sources(updated)
+        spotify_sources = updated
+        return updated[-1]
+
+
+def spotify_poll_worker():
+    """再生中のみ、現在再生中の曲情報を定期的に取得してWeb UI/OLED向けに保持する。"""
+    global spotify_current_source, spotify_now_playing
+    while not shutdown_event.is_set():
+        shutdown_event.wait(SPOTIFY_POLL_SECONDS)
+        with control_lock:
+            source = spotify_current_source
+        if source is None or not _spotify_configured():
+            continue
+        try:
+            data = _spotify_request("GET", "/me/player/currently-playing")
+        except SpotifyAPIError as exc:
+            log.warning("[Spotify] 再生中情報の取得に失敗しました: %s", exc)
+            continue
+        with control_lock:
+            if spotify_current_source is None:
+                continue
+            if not data or not data.get("is_playing") or not data.get("item"):
+                # 外部（スマホのSpotifyアプリ等）から一時停止・停止された可能性が高い。
+                spotify_current_source = None
+                spotify_now_playing = None
+                log.info("[Spotify] 外部要因により再生が停止しました")
+                continue
+            item = data["item"]
+            artists = "・".join(artist.get("name", "") for artist in item.get("artists", []))
+            images = item.get("album", {}).get("images", [])
+            spotify_now_playing = {
+                "track": item.get("name", ""),
+                "artist": artists,
+                "album_art_url": images[-1]["url"] if images else None,
+            }
+
+
 def get_volume():
     try:
         result = subprocess.run(
@@ -845,6 +1168,12 @@ def get_status():
             "ir_error": ir_error,
             "ir_codes": [{"number": number, "name": ir_codes[number]["name"]}
                          for number in sorted(ir_codes)],
+            "spotify_configured": _spotify_configured(),
+            "spotify_playing": spotify_current_source is not None,
+            "spotify_error": spotify_error,
+            "spotify_source": spotify_current_source,
+            "spotify_now_playing": spotify_now_playing,
+            "spotify_sources": spotify_sources,
         }
 
 
@@ -888,6 +1217,9 @@ table{width:100%;border-collapse:collapse;margin-top:8px}
 td{border:1px solid var(--line);padding:6px 8px;font-size:13px}
 input[type=text],table input{background:var(--bg);color:var(--text);border:1px solid var(--line);
 padding:6px;font:inherit;width:100%}
+.album-art{width:96px;height:96px;object-fit:cover;border:2px solid var(--line);margin-bottom:8px}
+#spotifySources,#spotifySearchResults{display:flex;flex-wrap:wrap;gap:8px}
+#spotifySources button,#spotifySearchResults button{width:auto;flex:1 1 auto;min-width:120px}
 .emergency-bar{position:fixed;left:0;right:0;bottom:0;padding:14px 16px;
 background:repeating-linear-gradient(45deg,#2a1010,#2a1010 12px,#160a0a 12px,#160a0a 24px);border-top:3px solid var(--red)}
 .emergency-bar button{border:2px solid var(--red);background:var(--red);color:#0d0f0d;font-weight:900;
@@ -898,12 +1230,14 @@ letter-spacing:.1em;max-width:650px;margin:0 auto}
 <small id="recordDetail"></small>
 <div class="status-row"><span class="led" id="ledRadio"></span><span id="radioStatus"></span></div>
 <div class="status-row"><span class="led" id="ledIr"></span><span id="irStatus"></span></div>
+<div class="status-row"><span class="led" id="ledSpotify"></span><span id="spotifyStatus"></span></div>
 </section>
 <nav class="tabs">
 <button class="tab-btn" data-tab="record" onclick="showTab('record')">録音</button>
 <button class="tab-btn" data-tab="radio" onclick="showTab('radio')">ラジオ</button>
 <button class="tab-btn" data-tab="mp3" onclick="showTab('mp3')">MP3</button>
 <button class="tab-btn" data-tab="ir" onclick="showTab('ir')">IR</button>
+<button class="tab-btn" data-tab="spotify" onclick="showTab('spotify')">Spotify</button>
 </nav>
 <div class="tab-panel" data-tab="record" hidden>
 <button class="start" onclick="postCommand('/api/record/start')">録音開始</button>
@@ -923,6 +1257,23 @@ letter-spacing:.1em;max-width:650px;margin:0 auto}
 <button class="start" onclick="postCommand('/api/ir/learn/start')">IR録音開始</button>
 <button class="stop" onclick="postCommand('/api/ir/learn/stop')">IR録音停止</button>
 <table id="irCodes"></table>
+</div>
+<div class="tab-panel" data-tab="spotify" hidden>
+<p id="spotifyUnconfigured" hidden>Spotifyが設定されていません（.envを確認してください）</p>
+<div id="spotifyControls">
+<div id="spotifyNowPlaying">
+<img id="spotifyAlbumArt" class="album-art" style="display:none">
+<div id="spotifyNowTrack"></div>
+<small id="spotifyNowArtist"></small>
+</div>
+<h2>再生リスト</h2>
+<div id="spotifySources"></div>
+<button class="stop" onclick="postCommand('/api/spotify/stop')">Spotify停止</button>
+<label for="spotifyQuery">アーティスト検索</label>
+<input id="spotifyQuery" type="text" placeholder="アーティスト名">
+<button onclick="searchSpotifyArtist()">検索</button>
+<div id="spotifySearchResults"></div>
+</div>
 </div>
 </main>
 <div class="emergency-bar"><button onclick="postCommand('/api/all/stop')">緊急停止（録音・ラジオ・MP3）</button></div>
@@ -959,11 +1310,37 @@ byId('volumeValue').textContent=data.volume===null?'--':data.volume;
 byId('irStatus').textContent=data.ir_error||IR_STATE_LABELS[data.ir_state]||'';
 byId('ledIr').className='led'+(data.ir_error?' error':(data.ir_state&&data.ir_state!=='idle')?' on blink':'');
 renderIrCodes(data.ir_codes||[]);
+byId('spotifyUnconfigured').hidden=!!data.spotify_configured;
+byId('spotifyControls').hidden=!data.spotify_configured;
+byId('spotifyStatus').textContent=data.spotify_error||(data.spotify_playing?`Spotify再生中: ${data.spotify_source?data.spotify_source.name:''}`:'Spotify停止');
+byId('ledSpotify').className='led'+(data.spotify_error?' error':data.spotify_playing?' on':'');
+renderSpotifySources(data.spotify_sources||[]);
+const nowPlaying=data.spotify_now_playing;
+byId('spotifyNowTrack').textContent=nowPlaying?nowPlaying.track:'';
+byId('spotifyNowArtist').textContent=nowPlaying?nowPlaying.artist:'';
+const art=byId('spotifyAlbumArt');
+if(nowPlaying&&nowPlaying.album_art_url){art.src=nowPlaying.album_art_url;art.style.display='block';}else{art.style.display='none';}
 }catch(error){byId('recordStatus').textContent='状態を取得できません';}}
 async function postCommand(url,options={}){try{const response=await fetch(url,{method:'POST',...options});const data=await response.json();
 if(!data.ok)alert(data.message||'操作に失敗しました');await updateStatus();}catch(error){alert('サーバーと通信できません');}}
 function startRadio(id){postCommand('/api/radio/start/'+encodeURIComponent(id));}
 function setVolume(value){postCommand('/api/volume',{headers:{'Content-Type':'application/json'},body:JSON.stringify({volume:Number(value)})});}
+function startSpotify(number){postCommand('/api/spotify/start/'+number);}
+let lastSpotifySourcesJson=null;
+function renderSpotifySources(sources){const json=JSON.stringify(sources);if(json===lastSpotifySourcesJson)return;lastSpotifySourcesJson=json;
+const box=byId('spotifySources');box.innerHTML='';
+for(const source of sources){const button=document.createElement('button');button.className='station';
+button.textContent=source.number+'. '+source.name;button.onclick=()=>startSpotify(source.number);box.appendChild(button);}}
+async function searchSpotifyArtist(){const query=byId('spotifyQuery').value.trim();if(!query)return;
+try{const response=await fetch('/api/spotify/search?q='+encodeURIComponent(query));const data=await response.json();
+if(!data.ok){alert(data.message||'検索に失敗しました');return;}
+renderSpotifySearchResults(data.results||[]);
+}catch(error){alert('サーバーと通信できません');}}
+function renderSpotifySearchResults(results){const box=byId('spotifySearchResults');box.innerHTML='';
+for(const result of results){const button=document.createElement('button');button.className='station';
+button.textContent=result.name;
+button.onclick=()=>postCommand('/api/spotify/add_artist',{headers:{'Content-Type':'application/json'},body:JSON.stringify({name:result.name,spotify_id:result.spotify_id})});
+box.appendChild(button);}}
 showTab('record');updateStatus();setInterval(updateStatus,1000);
 </script></body></html>"""
 
@@ -1071,8 +1448,56 @@ def web_ir_rename(number):
     return jsonify(ok=ok, message=message), 200 if ok else 400
 
 
+@app.post("/api/spotify/start/<number>")
+def web_spotify_start(number):
+    try:
+        index_number = int(number)
+    except ValueError:
+        return jsonify(ok=False, message="番号は整数で指定してください"), 400
+    with control_lock:
+        source = next((item for item in spotify_sources if item["number"] == index_number), None)
+    if source is None:
+        return jsonify(ok=False, message="指定した番号のSpotify再生リストが見つかりません"), 404
+    ok, message = start_spotify(source)
+    return jsonify(ok=ok, message=message), 200 if ok else 409
+
+
+@app.post("/api/spotify/stop")
+def web_spotify_stop():
+    return jsonify(ok=True, stopped=stop_spotify())
+
+
+@app.get("/api/spotify/search")
+def web_spotify_search():
+    query = (request.args.get("q") or "").strip()
+    if not query:
+        return jsonify(ok=False, message="検索語を入力してください"), 400
+    if not _spotify_configured():
+        return jsonify(ok=False, message="Spotifyが設定されていません"), 409
+    try:
+        results = spotify_search_artists(query)
+    except SpotifyAPIError as exc:
+        return jsonify(ok=False, message=str(exc)), 502
+    return jsonify(ok=True, results=results)
+
+
+@app.post("/api/spotify/add_artist")
+def web_spotify_add_artist():
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    spotify_id = (body.get("spotify_id") or "").strip()
+    if not name or not spotify_id:
+        return jsonify(ok=False, message="アーティスト情報が不正です"), 400
+    try:
+        source = add_spotify_artist(name, spotify_id)
+    except OSError as exc:
+        return jsonify(ok=False, message=f"再生リストを保存できません: {exc}"), 500
+    ok, message = start_spotify(source)
+    return jsonify(ok=ok, message=message, source=source), 200 if ok else 409
+
+
 def handle_keyboard_key(number):
-    global stations, radio_error, keyboard_error
+    global stations, radio_error, keyboard_error, spotify_sources, spotify_error
     with control_lock:
         if number in (1, 5):
             keyboard_error = None
@@ -1108,6 +1533,38 @@ def handle_keyboard_key(number):
             keyboard_error = None
             radio_error = None
             toggle_recording()
+        elif number in (2, 6):
+            log.info("[Spotify] Ctrl+%s pressed", number)
+            if not _spotify_configured():
+                return
+            try:
+                configured_sources = load_spotify_sources()
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                spotify_error = str(exc)
+                log.error("Spotify再生リスト読み込みエラー: %s", exc)
+                return
+            spotify_sources = configured_sources
+            if not configured_sources:
+                spotify_error = "Spotify再生リストが空です（spotify_sources.jsonを確認してください）"
+                return
+            playing = spotify_current_source is not None
+            if number == 6 and not playing:
+                return  # 停止中のCtrl+6は何もしない（仕様通り）
+            if not playing:
+                selected_id = _load_spotify_selection()
+                source = next((item for item in configured_sources
+                              if item["spotify_id"] == selected_id), configured_sources[0])
+            else:
+                ids = [item["spotify_id"] for item in configured_sources]
+                current_id = spotify_current_source["spotify_id"]
+                if current_id in ids:
+                    index = ids.index(current_id)
+                    source = configured_sources[(index + (1 if number == 2 else -1)) % len(ids)]
+                    log.info("[Spotify] %s source: %s",
+                             "Next" if number == 2 else "Previous", source["name"])
+                else:
+                    source = configured_sources[0]
+            start_spotify(source)
         elif number == 8:
             emergency_stop()
 
@@ -1212,7 +1669,7 @@ def cleanup():
             return
         cleanup_done = True
         shutdown_event.set()
-        for stop in (stop_recording, stop_radio, cancel_ir_learning):
+        for stop in (stop_recording, stop_radio, cancel_ir_learning, stop_spotify):
             try:
                 stop()
             except Exception:
@@ -1260,7 +1717,7 @@ def configure_bluetooth_audio():
 
 
 def main():
-    global record_led, ir_rx_led, ir_tx_led, upload_thread, oled_device, oled_thread
+    global record_led, ir_rx_led, ir_tx_led, upload_thread, oled_device, oled_thread, spotify_poll_thread
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     def request_shutdown(signum, frame):
         log.info("終了シグナル: %s", signal.Signals(signum).name)
@@ -1292,6 +1749,8 @@ def main():
         scanner.start()
         upload_thread = threading.Thread(target=upload_worker, daemon=True)
         upload_thread.start()
+        spotify_poll_thread = threading.Thread(target=spotify_poll_worker, daemon=True)
+        spotify_poll_thread.start()
         try:
             from luma.core.interface.serial import i2c
             from luma.oled.device import ssd1309
@@ -1320,6 +1779,8 @@ def main():
             upload_thread.join(timeout=5)
         if oled_thread is not None:
             oled_thread.join(timeout=2)
+        if spotify_poll_thread is not None:
+            spotify_poll_thread.join(timeout=2)
 
 
 if __name__ == "__main__":

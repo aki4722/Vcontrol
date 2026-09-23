@@ -1,0 +1,22 @@
+[Unit]
+Description=librespot (Spotify Connect device for voice-control)
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=akimoto
+WorkingDirectory=/home/akimoto
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStart=/usr/local/bin/librespot \
+    --name Vcon \
+    --backend pulseaudio \
+    --cache /home/akimoto/.cache/librespot \
+    --system-cache /home/akimoto/.cache/librespot \
+    --initial-volume 100 \
+    --disable-discovery
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

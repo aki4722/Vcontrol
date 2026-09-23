@@ -24,6 +24,14 @@ class ControlsTest(unittest.TestCase):
         patcher = patch.object(app, 'IR_CODES_FILE', self.ir_codes_file)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.spotify_sources_file = Path(directory.name) / 'spotify_sources.json'
+        patcher = patch.object(app, 'SPOTIFY_SOURCES_FILE', self.spotify_sources_file)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.spotify_selection_file = Path(directory.name) / 'spotify_selection.json'
+        patcher = patch.object(app, 'SPOTIFY_SELECTION_FILE', self.spotify_selection_file)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         app.selected_station_number = 1
         original_stations = app.stations
         self.addCleanup(setattr, app, 'stations', original_stations)
@@ -50,6 +58,19 @@ class ControlsTest(unittest.TestCase):
         app.ir_next_number = 1
         app.ir_rx_led = Mock()
         app.ir_tx_led = Mock()
+        app.spotify_sources = []
+        app.spotify_current_source = None
+        app.spotify_now_playing = None
+        app.spotify_error = None
+        app.spotify_generation = 0
+        app.spotify_access_token = None
+        app.spotify_token_expiry = 0.0
+        app.spotify_device_id = None
+        app.spotify_configured_warned = False
+        patcher = patch.multiple(app, SPOTIFY_CLIENT_ID='client-id', SPOTIFY_CLIENT_SECRET='secret',
+                                  SPOTIFY_REFRESH_TOKEN='refresh-token')
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_bluetooth_profile_only_when_connected(self):
         for connected in (True, False):
@@ -397,12 +418,14 @@ class ControlsTest(unittest.TestCase):
     def test_unused_keys_have_no_radio_action(self):
         with patch.object(app, 'start_radio') as start, \
              patch.object(app, 'stop_radio') as stop, \
-             patch.object(app, 'load_stations') as load:
-            for key in (2, 3, 6, 7):
+             patch.object(app, 'load_stations') as load, \
+             patch.object(app, 'start_spotify') as spotify_start:
+            for key in (3, 7):
                 app.handle_keyboard_key(key)
             start.assert_not_called()
             stop.assert_not_called()
             load.assert_not_called()
+            spotify_start.assert_not_called()
         self.assertFalse(self.station_file.exists())
 
     def test_station_config_error_preserves_playback(self):
@@ -683,6 +706,254 @@ class ControlsTest(unittest.TestCase):
             app.start_recording()
         app.ir_rx_led.on.assert_not_called()
         app.ir_tx_led.on.assert_not_called()
+
+    # ---- Spotify ----
+
+    def test_spotify_ctrl2_stopped_starts_saved_selection(self):
+        sources = [
+            {'number': 1, 'type': 'playlist', 'name': 'A', 'spotify_id': 'id-a'},
+            {'number': 2, 'type': 'artist', 'name': 'B', 'spotify_id': 'id-b'},
+        ]
+        self.spotify_selection_file.write_text(json.dumps({'spotify_id': 'id-b', 'type': 'artist'}))
+        with patch.object(app, 'load_spotify_sources', return_value=sources), \
+             patch.object(app, 'start_spotify') as start:
+            app.handle_keyboard_key(2)
+        start.assert_called_once_with(sources[1])
+
+    def test_spotify_ctrl2_stopped_defaults_to_first_without_saved_selection(self):
+        sources = [{'number': 1, 'type': 'playlist', 'name': 'A', 'spotify_id': 'id-a'}]
+        with patch.object(app, 'load_spotify_sources', return_value=sources), \
+             patch.object(app, 'start_spotify') as start:
+            app.handle_keyboard_key(2)
+        start.assert_called_once_with(sources[0])
+
+    def test_spotify_ctrl2_playing_advances_and_ctrl6_goes_back_with_wraparound(self):
+        sources = [
+            {'number': 1, 'type': 'playlist', 'name': 'A', 'spotify_id': 'id-a'},
+            {'number': 2, 'type': 'playlist', 'name': 'B', 'spotify_id': 'id-b'},
+            {'number': 3, 'type': 'artist', 'name': 'C', 'spotify_id': 'id-c'},
+        ]
+        app.spotify_current_source = sources[2]
+        with patch.object(app, 'load_spotify_sources', return_value=sources), \
+             patch.object(app, 'start_spotify') as start:
+            app.handle_keyboard_key(2)
+        start.assert_called_once_with(sources[0])
+        app.spotify_current_source = sources[0]
+        with patch.object(app, 'load_spotify_sources', return_value=sources), \
+             patch.object(app, 'start_spotify') as start:
+            app.handle_keyboard_key(6)
+        start.assert_called_once_with(sources[2])
+
+    def test_spotify_ctrl6_while_stopped_is_noop(self):
+        sources = [{'number': 1, 'type': 'playlist', 'name': 'A', 'spotify_id': 'id-a'}]
+        with patch.object(app, 'load_spotify_sources', return_value=sources), \
+             patch.object(app, 'start_spotify') as start:
+            app.handle_keyboard_key(6)
+        start.assert_not_called()
+
+    def test_spotify_keys_noop_when_not_configured(self):
+        with patch.multiple(app, SPOTIFY_CLIENT_ID='', SPOTIFY_CLIENT_SECRET='', SPOTIFY_REFRESH_TOKEN=''), \
+             patch.object(app, 'load_spotify_sources') as load, \
+             patch.object(app, 'start_spotify') as start:
+            app.handle_keyboard_key(2)
+            app.handle_keyboard_key(6)
+        load.assert_not_called()
+        start.assert_not_called()
+
+    def test_start_spotify_stops_radio_and_spawns_worker(self):
+        source = {'number': 1, 'type': 'playlist', 'name': 'A', 'spotify_id': 'id-a'}
+        app.radio_process = Mock(pid=1, stdout=None, poll=Mock(return_value=None))
+        app.current_station = app.stations[0]
+        with patch.object(app, '_terminate_group'), \
+             patch.object(app.threading, 'Thread') as thread_cls:
+            ok, message = app.start_spotify(source)
+        self.assertTrue(ok)
+        self.assertIsNone(app.radio_process)
+        thread_cls.assert_called_once()
+        self.assertEqual(thread_cls.call_args.kwargs['args'], (source, app.spotify_generation))
+
+    def test_start_spotify_blocked_while_recording(self):
+        app.record_process = Mock(poll=Mock(return_value=None))
+        source = {'number': 1, 'type': 'playlist', 'name': 'A', 'spotify_id': 'id-a'}
+        with patch.object(app.threading, 'Thread') as thread_cls:
+            ok, message = app.start_spotify(source)
+        self.assertFalse(ok)
+        thread_cls.assert_not_called()
+
+    def test_start_spotify_rejects_when_not_configured(self):
+        source = {'number': 1, 'type': 'playlist', 'name': 'A', 'spotify_id': 'id-a'}
+        with patch.multiple(app, SPOTIFY_CLIENT_ID='', SPOTIFY_CLIENT_SECRET='', SPOTIFY_REFRESH_TOKEN=''), \
+             patch.object(app.threading, 'Thread') as thread_cls:
+            ok, message = app.start_spotify(source)
+        self.assertFalse(ok)
+        thread_cls.assert_not_called()
+
+    def test_spotify_play_worker_success(self):
+        source = {'number': 1, 'type': 'playlist', 'name': 'A', 'spotify_id': 'id-a'}
+        with patch.object(app, '_spotify_find_device_id', return_value='device-1'), \
+             patch.object(app, '_spotify_request') as request, \
+             self.assertLogs(app.log, level='INFO'):
+            app._spotify_play_worker(source, app.spotify_generation)
+        self.assertEqual(app.spotify_current_source, source)
+        self.assertIsNone(app.spotify_error)
+        self.assertEqual(json.loads(self.spotify_selection_file.read_text())['spotify_id'], 'id-a')
+        self.assertEqual(request.call_count, 2)
+
+    def test_spotify_play_worker_error_sets_spotify_error(self):
+        source = {'number': 1, 'type': 'playlist', 'name': 'A', 'spotify_id': 'id-a'}
+        with patch.object(app, '_spotify_find_device_id', side_effect=app.SpotifyAPIError('boom')), \
+             self.assertLogs(app.log, level='ERROR'):
+            app._spotify_play_worker(source, app.spotify_generation)
+        self.assertIsNone(app.spotify_current_source)
+        self.assertEqual(app.spotify_error, 'boom')
+
+    def test_spotify_play_worker_discards_stale_generation(self):
+        source = {'number': 1, 'type': 'playlist', 'name': 'A', 'spotify_id': 'id-a'}
+        with patch.object(app, '_spotify_find_device_id', return_value='device-1'), \
+             patch.object(app, '_spotify_request'):
+            app._spotify_play_worker(source, app.spotify_generation - 1)
+        self.assertIsNone(app.spotify_current_source)
+
+    def test_spotify_play_worker_retries_device_lookup_once_on_failure(self):
+        source = {'number': 1, 'type': 'playlist', 'name': 'A', 'spotify_id': 'id-a'}
+        with patch.object(app, '_spotify_find_device_id',
+                           side_effect=['device-1', 'device-2']) as find_device, \
+             patch.object(app, '_spotify_request',
+                           side_effect=[app.SpotifyAPIError('stale'), None, None]), \
+             self.assertLogs(app.log, level='INFO'):
+            app._spotify_play_worker(source, app.spotify_generation)
+        self.assertEqual(find_device.call_count, 2)
+        self.assertEqual(app.spotify_current_source, source)
+
+    def test_stop_spotify_clears_state_and_fires_pause(self):
+        app.spotify_current_source = {'number': 1, 'type': 'playlist', 'name': 'A', 'spotify_id': 'id-a'}
+        with patch.object(app.threading, 'Thread') as thread_cls:
+            stopped = app.stop_spotify()
+        self.assertTrue(stopped)
+        self.assertIsNone(app.spotify_current_source)
+        thread_cls.assert_called_once()
+
+    def test_stop_spotify_when_already_stopped_is_noop(self):
+        with patch.object(app.threading, 'Thread') as thread_cls:
+            stopped = app.stop_spotify()
+        self.assertFalse(stopped)
+        thread_cls.assert_not_called()
+
+    def test_start_radio_stops_spotify(self):
+        app.spotify_current_source = {'number': 1, 'type': 'playlist', 'name': 'A', 'spotify_id': 'id-a'}
+        process = Mock(pid=101, stdout=None, poll=Mock(return_value=None))
+        with patch.object(app.subprocess, 'Popen', return_value=process), \
+             patch.object(app, '_terminate_group'), \
+             patch.object(app.threading, 'Thread') as thread_cls:
+            app.start_radio(app.stations[0])
+        self.assertIsNone(app.spotify_current_source)
+        thread_cls.assert_called_once()
+
+    def test_start_recording_stops_spotify(self):
+        app.spotify_current_source = {'number': 1, 'type': 'playlist', 'name': 'A', 'spotify_id': 'id-a'}
+        with patch.object(app, '_stop_radio_locked'), \
+             patch.object(app, '_open_file'), patch.object(app, 'SAVE_DIR'), \
+             patch.object(app, '_refresh_storage_status', return_value={
+                 'mounted': True, 'free_gib': 100.0, 'total_gib': 200.0, 'low': False}), \
+             patch.object(app.threading, 'Thread'), \
+             patch.object(app.subprocess, 'Popen', return_value=Mock()):
+            app.start_recording()
+        self.assertIsNone(app.spotify_current_source)
+
+    def test_emergency_stop_stops_spotify(self):
+        app.spotify_current_source = {'number': 1, 'type': 'playlist', 'name': 'A', 'spotify_id': 'id-a'}
+        with patch.object(app, '_spotify_pause_best_effort'):
+            app.emergency_stop()
+        self.assertIsNone(app.spotify_current_source)
+
+    def test_cleanup_stops_spotify(self):
+        app.cleanup_done = False
+        app.spotify_current_source = {'number': 1, 'type': 'playlist', 'name': 'A', 'spotify_id': 'id-a'}
+        with patch.object(app, '_spotify_pause_best_effort'), \
+             patch.object(app, 'stop_recording'), patch.object(app, 'stop_radio'), \
+             patch.object(app, 'cancel_ir_learning'):
+            app.cleanup()
+        self.assertIsNone(app.spotify_current_source)
+        app.cleanup_done = False
+
+    def test_status_includes_spotify_fields(self):
+        app.spotify_sources = [{'number': 1, 'type': 'playlist', 'name': 'A', 'spotify_id': 'id-a'}]
+        app.spotify_current_source = app.spotify_sources[0]
+        app.spotify_now_playing = {'track': 'T', 'artist': 'Ar', 'album_art_url': 'http://x'}
+        with patch.object(app, 'get_volume', return_value=50):
+            status = app.get_status()
+        self.assertTrue(status['spotify_configured'])
+        self.assertTrue(status['spotify_playing'])
+        self.assertEqual(status['spotify_source']['name'], 'A')
+        self.assertEqual(status['spotify_now_playing']['track'], 'T')
+        self.assertEqual(status['spotify_sources'], app.spotify_sources)
+
+    def test_spotify_oled_shows_source_and_now_playing(self):
+        app.spotify_sources = [{'number': 1, 'type': 'playlist', 'name': 'ドライブ', 'spotify_id': 'id-a'}]
+        app.spotify_current_source = app.spotify_sources[0]
+        self.assertEqual(app._oled_lines()[1], 'SPOTIFY 1/1')
+        self.assertEqual(app._oled_lines()[2], 'ドライブ')
+        app.spotify_now_playing = {'track': '希望の轍', 'artist': 'サザンオールスターズ', 'album_art_url': None}
+        self.assertEqual(app._oled_lines()[2], '希望の轍 - サザンオールスターズ')
+
+    def test_load_spotify_sources_missing_file_returns_empty(self):
+        self.assertEqual(app.load_spotify_sources(), [])
+
+    def test_load_spotify_sources_assigns_numbers(self):
+        self.spotify_sources_file.write_text(json.dumps([
+            {'type': 'playlist', 'name': 'A', 'spotify_id': 'id-a'},
+            {'type': 'artist', 'name': 'B', 'spotify_id': 'id-b'},
+        ]))
+        sources = app.load_spotify_sources()
+        self.assertEqual([source['number'] for source in sources], [1, 2])
+
+    def test_load_spotify_sources_rejects_invalid_entry(self):
+        self.spotify_sources_file.write_text(json.dumps([{'type': 'song', 'name': 'A', 'spotify_id': 'id-a'}]))
+        with self.assertRaises(ValueError):
+            app.load_spotify_sources()
+
+    def test_add_spotify_artist_appends_and_persists(self):
+        app.spotify_sources = [{'number': 1, 'type': 'playlist', 'name': 'A', 'spotify_id': 'id-a'}]
+        source = app.add_spotify_artist('新人', 'id-new')
+        self.assertEqual(source['number'], 2)
+        self.assertEqual(len(app.spotify_sources), 2)
+        saved = json.loads(self.spotify_sources_file.read_text())
+        self.assertEqual(saved[-1]['name'], '新人')
+
+    def test_add_spotify_artist_dedupes_existing(self):
+        app.spotify_sources = [{'number': 1, 'type': 'artist', 'name': 'A', 'spotify_id': 'id-a'}]
+        source = app.add_spotify_artist('A again', 'id-a')
+        self.assertEqual(source['name'], 'A')
+        self.assertEqual(len(app.spotify_sources), 1)
+
+    def test_spotify_ensure_token_refreshes_when_missing(self):
+        response = Mock(status_code=200)
+        response.json.return_value = {'access_token': 'tok', 'expires_in': 3600}
+        with patch.object(app.requests, 'post', return_value=response) as post:
+            token = app._spotify_ensure_token()
+        self.assertEqual(token, 'tok')
+        post.assert_called_once()
+
+    def test_spotify_ensure_token_wraps_network_error(self):
+        with patch.object(app.requests, 'post', side_effect=app.requests.RequestException('down')):
+            with self.assertRaises(app.SpotifyAPIError):
+                app._spotify_ensure_token()
+
+    def test_spotify_request_raises_on_http_error(self):
+        app.spotify_access_token = 'tok'
+        app.spotify_token_expiry = app.time.monotonic() + 3600
+        response = Mock(status_code=403, content=b'{"error":{"message":"forbidden"}}')
+        response.json.return_value = {'error': {'message': 'forbidden'}}
+        with patch.object(app.requests, 'request', return_value=response):
+            with self.assertRaises(app.SpotifyAPIError):
+                app._spotify_request('GET', '/me/player')
+
+    def test_spotify_request_wraps_network_error(self):
+        app.spotify_access_token = 'tok'
+        app.spotify_token_expiry = app.time.monotonic() + 3600
+        with patch.object(app.requests, 'request', side_effect=app.requests.RequestException('down')):
+            with self.assertRaises(app.SpotifyAPIError):
+                app._spotify_request('GET', '/me/player')
 
 
 if __name__ == '__main__':

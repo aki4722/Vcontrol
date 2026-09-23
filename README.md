@@ -17,10 +17,12 @@ SSH端末から送信するキーには対応しません。キー入力は他�
 | --- | --- |
 | Ctrl+1 | 停止中は最後の局を再生／再生中は次の局 |
 | Ctrl+5 | 停止中は最後の局を再生／再生中は前の局 |
-| Ctrl+2・3 | 未使用 |
+| Ctrl+2 | Spotify: 停止中は前回の再生リストを再生／再生中は次の再生リスト |
+| Ctrl+3 | 未使用 |
 | Ctrl+4 | 録音開始／停止 |
-| Ctrl+6～7 | 未使用 |
-| Ctrl+8 | ラジオ・録音・アップロードを強制停止し待機へ |
+| Ctrl+6 | Spotify: 再生中は前の再生リストへ／停止中は何もしない |
+| Ctrl+7 | 未使用 |
+| Ctrl+8 | ラジオ・録音・Spotify・アップロードを強制停止し待機へ |
 
 選局は局番号順に循環します。他局への切り替えは停止完了後に再生します。
 録音開始・停止はCtrl+4またはWebから操作します。
@@ -93,6 +95,72 @@ MP3再生中のCtrl+1 / Ctrl+5は保存済みのラジオ局へ戻ります。
 エラーを表示します。ダウンロード完了前の開始応答は取得開始を意味します。
 停止後は一時ファイルを削除し、次回開始時に再取得します。
 変更の反映には `sudo systemctl restart voice-control.service` が必要です。
+
+## Spotify再生
+
+Spotifyのプレイリスト・アーティストを「再生リスト」として登録し、Ctrl+2・Ctrl+6や
+Web UIからシャッフル再生できます。実際の音声出力は本サービスとは別の常駐サービス
+`librespot.service`（[librespot](https://github.com/librespot-org/librespot)、Spotify
+Connect対応デバイス）が行い、`listen.py`はSpotify Web API経由でその再生を指示する
+だけです（librespotプロセス自体の起動・停止は行いません）。
+
+### 初回セットアップ
+
+1. [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard) でアプリを
+   作成し、Client ID/Secretを取得。Redirect URIに `http://127.0.0.1:8888/callback` を登録。
+2. `.env` に `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` を設定し、
+   `venv/bin/python spotify_auth_setup.py` を実行（対話式。表示されたURLをブラウザで開いて
+   ログイン・許可し、リダイレクト後のURLを貼り付けると `SPOTIFY_REFRESH_TOKEN` が自動的に
+   `.env` へ保存されます）。このスクリプトは常駐プロセスとは無関係な使い捨てのセットアップ
+   専用ツールで、`.env`の内容を表示・出力することはありません。
+3. Rust(`cargo`)と `pkg-config`・`libpulse-dev` を導入し、librespotをソースから
+   `cargo build --release --no-default-features --features "native-tls,pulseaudio-backend,with-libmdns"`
+   でビルドします。
+4. `librespot --name Vcon --backend pulseaudio --cache ~/.cache/librespot --system-cache ~/.cache/librespot --enable-device-auth`
+   を一度だけ手動実行し、表示される `https://spotify.com/pair?code=XXXXXX` を任意のブラウザで
+   開いてペアリングします（認証情報は`--cache`ディレクトリにキャッシュされ、以降は不要）。
+5. ビルドしたバイナリを `sudo install -m 755 librespot /usr/local/bin/librespot` で配置し、
+   `sudo cp librespot.service /etc/systemd/system/ && sudo systemctl daemon-reload &&
+   sudo systemctl enable --now librespot.service` で常駐化します。
+
+### 再生リストの登録
+
+`spotify_sources.json`（`listen.py`と同じディレクトリ、JSON配列）で管理します。番号は
+配列内の並び順（1始まり）です。プレイリストはSpotifyの共有リンク等からIDを調べて
+手動編集で追加します（Spotify側でのプレイリストの作成・編集はそちらのアプリで行い、
+本システムは再生専用です）。
+
+```json
+[
+  {"type": "playlist", "name": "ドライブ", "spotify_id": "37i9dQZF1..."},
+  {"type": "artist", "name": "サザンオールスターズ", "spotify_id": "3drOkl3f..."}
+]
+```
+
+アーティストはWeb UIの「アーティスト検索」から選ぶと自動的にこのファイルへ追記され
+（重複するspotify_idは追加しません）、選んだアーティストの曲がその場でシャッフル再生
+されます。ラジオの局番号選択キー同様、Ctrl+2・Ctrl+6を押すたびにこのファイルを読み直す
+ため、手動編集した内容もサービス再起動なしに反映されます（Web UIの一覧表示は
+`/api/status`のポーリングで更新されます）。
+
+再生は常にシャッフルです（プレイリスト・アーティストいずれも通常の順番再生には
+対応しません）。最後に選択した再生リストは `spotify_selection.json` に保存され、
+`voice-control.service`（Raspberry Pi）再起動後もCtrl+2で復元されます。
+
+### 排他制御・エラー処理
+
+ラジオとSpotifyは同時に再生しません。どちらかを開始すると、もう一方は自動的に
+停止します（録音開始時も同様にSpotifyを停止し、録音中のSpotify開始は受け付けません）。
+Ctrl+8の強制停止では録音・ラジオ・Spotifyのすべてを止めます。
+
+Spotify Web APIの認証切れ・通信エラー・再生デバイス（librespot）未検出・プレイリスト
+取得失敗などが発生してもvoice-control全体は継続動作し、ログとWeb UI・OLEDの状態欄に
+エラーを表示するだけです。`.env`にSpotifyの認証情報が設定されていない場合は
+Ctrl+2・Ctrl+6は何もせず、Web UIには「Spotifyが設定されていません」と表示されます。
+
+OLEDには再生中に `SPOTIFY 現在番号/総数` と、取得できていれば曲名・アーティスト名
+（未取得の間は再生リスト名）を表示します。長い場合は既存の局名表示と同じ方式で
+画面幅に収まるよう切り詰めます。
 
 ## IRリモコン学習・送信
 
@@ -197,7 +265,7 @@ OLEDが未接続または故障していても、録音・ラジオ機能は継�
 Bluetoothスピーカーなど出力先を固定する場合は `mpv --audio-device=help` で名前を
 確認し、`.env` に `MPV_AUDIO_DEVICE=pipewire/bluez_output...` を設定してください。
 
-設定可能な環境変数は `WEB_HOST`、`WEB_PORT`、`RECORDINGS_DIR`、`SSD_MOUNT_POINT`、`GDRIVE_DIR`、`OLED_PORT`、`OLED_ADDRESS` です。放送局は `stations.conf` に番号付きINI形式で登録します。radiko プレミアムを使う場合の資格情報は既存の `.env` に設定します。
+設定可能な環境変数は `WEB_HOST`、`WEB_PORT`、`RECORDINGS_DIR`、`SSD_MOUNT_POINT`、`GDRIVE_DIR`、`OLED_PORT`、`OLED_ADDRESS`、`SPOTIFY_CLIENT_ID`、`SPOTIFY_CLIENT_SECRET`、`SPOTIFY_REFRESH_TOKEN`、`SPOTIFY_DEVICE_NAME` です。放送局は `stations.conf` に番号付きINI形式で登録します。radiko プレミアムを使う場合の資格情報は既存の `.env` に設定します。Spotifyのセットアップは「Spotify再生」の章を参照してください。
 
 ## 起動時のJQ-BTプロファイル設定
 
