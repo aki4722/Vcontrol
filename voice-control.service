@@ -1,8 +1,7 @@
 [Unit]
 Description=Raspberry Pi recording and radio control
-After=network-online.target sound.target mnt-ssd.mount
+After=network-online.target sound.target
 Wants=network-online.target
-RequiresMountsFor=/mnt/ssd
 
 [Service]
 Type=simple

@@ -16,7 +16,7 @@ import tempfile
 import threading
 import wave
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -25,9 +25,8 @@ from gpiozero import LED
 import requests
 
 BASE_DIR = Path(__file__).resolve().parent
-SSD_MOUNT_POINT = Path(os.environ.get("SSD_MOUNT_POINT", "/mnt/ssd"))
-SAVE_DIR = Path(os.environ.get("RECORDINGS_DIR", str(SSD_MOUNT_POINT / "voice")))
-SSD_LOW_SPACE_GIB = 1.0
+# 録音はまずPi本体（microSD）のローカルへ書き、完成したファイルをrcloneでGDRIVE_DIRへアップロードする。
+SAVE_DIR = Path(os.environ.get("RECORDINGS_DIR", "/home/akimoto/recordings"))
 STATIONS_FILE = BASE_DIR / "stations.conf"
 RADIO_STATION_FILE = BASE_DIR / "radio_station.txt"
 RADIO_SCRIPT = BASE_DIR / "play_radiko.sh"
@@ -52,7 +51,6 @@ SD_MOUNT_POINT = Path("/")
 CPU_TEMP_FILE = Path("/sys/class/thermal/thermal_zone0/temp")
 CPU_TEMP_UPDATE_SECONDS = 30
 STORAGE_UPDATE_SECONDS = 30
-SSD_PROBE_TIMEOUT_SECONDS = 2.0
 REC_BLINK_SECONDS = 0.5
 IR_RX_LED_GPIO = 22
 IR_TX_LED_GPIO = 10
@@ -76,6 +74,16 @@ SPOTIFY_REQUEST_TIMEOUT_SECONDS = 10
 SPOTIFY_POLL_SECONDS = 5
 SPOTIFY_TOKEN_REFRESH_MARGIN_SECONDS = 60
 SPOTIFY_STOP_TIMEOUT_SECONDS = 3
+SCHEDULES_FILE = BASE_DIR / "schedules.json"
+# 同じ分に複数タスクがある場合はこの順で実行する（停止→IR→開始）。
+SCHEDULE_ACTIONS = ("playback_stop", "record_stop", "ir", "record_start", "radio", "mp3", "spotify")
+SCHEDULE_ACTION_LABELS = {
+    "radio": "ラジオ再生", "mp3": "MP3再生", "spotify": "Spotify再生", "ir": "IR送信",
+    "record_start": "録音開始", "record_stop": "録音停止", "playback_stop": "再生停止",
+}
+SCHEDULE_REPEATS = ("daily", "weekly", "once")
+SCHEDULE_CATCHUP_SECONDS = 90
+SCHEDULE_IR_GAP_SECONDS = 0.3
 
 log = logging.getLogger(__name__)
 app = Flask(__name__)
@@ -85,6 +93,7 @@ upload_lock = threading.Lock()
 upload_process = None
 upload_generation = 0
 upload_thread = None
+upload_last_failed = False
 shutdown_event = threading.Event()
 record_process = None
 writer_thread = None
@@ -103,8 +112,6 @@ oled_thread = None
 spotify_poll_thread = None
 cpu_temperature_text = "CPU --c"
 cpu_temperature_updated_at = None
-storage_status = {"mounted": False, "free_gib": None, "total_gib": None, "low": False}
-storage_status_updated_at = None
 sd_free_text = "SD --G"
 sd_free_updated_at = None
 ir_state = IR_STATE_IDLE
@@ -124,6 +131,8 @@ spotify_access_token = None
 spotify_token_expiry = 0.0
 spotify_device_id = None
 spotify_configured_warned = False
+scheduler_thread = None
+scheduler_last_checked = None
 
 
 def load_stations():
@@ -194,6 +203,110 @@ def _save_ir_codes():
 
 
 ir_codes, ir_next_number = _load_ir_codes()
+
+
+def _normalize_schedule(data, check_targets=True):
+    """Web入力・保存ファイルのスケジュール1件を検証して正規化する。不正ならValueError。
+    check_targets=Falseは起動時の読み込み用（局やIRが後から消えていても実行時エラーとして扱う）。"""
+    if not isinstance(data, dict):
+        raise ValueError("スケジュールの形式が不正です")
+    time_text = data.get("time")
+    if not isinstance(time_text, str) or not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", time_text):
+        raise ValueError("時刻はHH:MM形式で指定してください")
+    repeat = data.get("repeat")
+    if repeat not in SCHEDULE_REPEATS:
+        raise ValueError("繰り返しの指定が不正です")
+    weekdays = []
+    run_date = None
+    if repeat == "weekly":
+        weekdays = data.get("weekdays")
+        if (not isinstance(weekdays, list) or not weekdays
+                or any(type(day) is not int or not 0 <= day <= 6 for day in weekdays)):
+            raise ValueError("曜日を1つ以上選択してください")
+        weekdays = sorted(set(weekdays))
+    elif repeat == "once":
+        try:
+            run_date = date.fromisoformat(data.get("date") or "").isoformat()
+        except (TypeError, ValueError):
+            raise ValueError("実行日をYYYY-MM-DD形式で指定してください") from None
+    action = data.get("action")
+    if action not in SCHEDULE_ACTIONS:
+        raise ValueError("実行する機能の指定が不正です")
+    target = data.get("target")
+    if action in ("radio", "ir"):
+        try:
+            target = int(target)
+        except (TypeError, ValueError):
+            raise ValueError("対象を選択してください") from None
+        if check_targets:
+            if action == "radio" and not any(item["number"] == target for item in _schedule_stations()):
+                raise ValueError("指定した放送局が見つかりません")
+            if action == "ir" and target not in ir_codes:
+                raise ValueError("指定したIR番号が見つかりません")
+    elif action == "mp3":
+        if not isinstance(target, str) or not target:
+            raise ValueError("対象を選択してください")
+        if check_targets and target != MP3_NAME:
+            raise ValueError("指定した音楽が見つかりません")
+    elif action == "spotify":
+        # 番号は並び順で変わるため、spotify_idで保存する。
+        if not isinstance(target, str) or not target:
+            raise ValueError("対象を選択してください")
+        if check_targets and not any(item["spotify_id"] == target for item in _schedule_spotify_sources()):
+            raise ValueError("指定したSpotify再生リストが見つかりません")
+    else:
+        target = None
+    enabled = data.get("enabled", True)
+    if type(enabled) is not bool:
+        raise ValueError("有効/無効の指定が不正です")
+    return {"time": time_text, "repeat": repeat, "weekdays": weekdays, "date": run_date,
+            "action": action, "target": target, "enabled": enabled}
+
+
+def _schedule_once_finished(task):
+    """1回のみのタスクが予定日時に正常実行済みか（以前の版で無効化だけされて残ったものの掃除用）。"""
+    return (task["repeat"] == "once" and bool((task.get("last_result") or {}).get("ok"))
+            and task.get("last_run") == f"{task['date']}T{task['time']}")
+
+
+def _load_schedules():
+    """起動時に一度だけ読み込む。存在しない場合は空で開始する。
+    壊れている場合は次回保存で上書きしてしまわないよう .broken へ退避してから空で開始する。"""
+    if not SCHEDULES_FILE.exists():
+        return {}, 1
+    try:
+        data = json.loads(SCHEDULES_FILE.read_text(encoding="utf-8"))
+        result = {}
+        for item in data.get("tasks", []):
+            task = _normalize_schedule(item, check_targets=False)
+            task["id"] = int(item["id"])
+            task["last_run"] = item.get("last_run")
+            task["last_result"] = item.get("last_result")
+            if _schedule_once_finished(task):
+                log.info("[Scheduler] 完了済みの1回のみのタスク No.%s を削除しました", task["id"])
+                continue
+            result[task["id"]] = task
+        next_id = int(data.get("next_id", 1))
+        return result, max(next_id, max(result, default=0) + 1)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        log.error("schedules.jsonを読み込めません（空で開始します）: %s", exc)
+        try:
+            shutil.copy2(SCHEDULES_FILE, SCHEDULES_FILE.with_suffix(".json.broken"))
+        except OSError:
+            log.exception("壊れたschedules.jsonを退避できません")
+        return {}, 1
+
+
+def _save_schedules():
+    """radio_station.txtと同じ、.tmpへ書いてからPath.replace()する原子的更新。control_lock内で呼ぶ。"""
+    data = {"next_id": schedule_next_id,
+            "tasks": [schedules[number] for number in sorted(schedules)]}
+    temporary = SCHEDULES_FILE.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(SCHEDULES_FILE)
+
+
+schedules, schedule_next_id = _load_schedules()
 
 
 def load_spotify_sources():
@@ -282,57 +395,13 @@ def _sd_free_text():
     return sd_free_text
 
 
-def _probe_ssd_write(timeout=SSD_PROBE_TIMEOUT_SECONDS):
-    """SAVE_DIR配下へ実際に小さなファイルを書き込めるか確認する。
-    マウント表には残っているがデバイスが切断された「幽霊マウント」はstatvfs（空き容量取得）
-    だけでは検知できず、古いキャッシュ値が返ることがあるため、実I/Oで確かめる。
-    デバイス切断直後はI/Oが長時間ブロックすることがあるので、別スレッド+タイムアウトで実行し、
-    時間内に完了しなければ失敗扱いにする（元スレッドの待ちはそこで打ち切り、探査スレッドは
-    OSのタイムアウト任せでそのまま終了させる）。"""
-    result = {}
-
-    def probe():
-        try:
-            SAVE_DIR.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(dir=SAVE_DIR, prefix=".ssd_probe_"):
-                pass
-            result["ok"] = True
-        except OSError:
-            result["ok"] = False
-
-    thread = threading.Thread(target=probe, daemon=True)
-    thread.start()
-    thread.join(timeout)
-    return result.get("ok", False)
-
-
-def _refresh_storage_status():
-    """SSDの実マウント状態・実I/O・空き容量を即時確認する（キャッシュを使わない）。"""
-    global storage_status, storage_status_updated_at
-    if not os.path.ismount(SSD_MOUNT_POINT) or not _probe_ssd_write():
-        storage_status = {"mounted": False, "free_gib": None, "total_gib": None, "low": False}
-    else:
-        try:
-            usage = shutil.disk_usage(SSD_MOUNT_POINT)
-            free_gib = usage.free / (1024 ** 3)
-            storage_status = {
-                "mounted": True,
-                "free_gib": free_gib,
-                "total_gib": usage.total / (1024 ** 3),
-                "low": free_gib < SSD_LOW_SPACE_GIB,
-            }
-        except OSError:
-            storage_status = {"mounted": False, "free_gib": None, "total_gib": None, "low": False}
-    storage_status_updated_at = time.monotonic()
-    return storage_status
-
-
-def _cached_storage_status():
-    """OLED表示向け。30秒ごとにのみ実ディスクを確認する。"""
-    now = time.monotonic()
-    if storage_status_updated_at is None or now - storage_status_updated_at >= STORAGE_UPDATE_SECONDS:
-        return _refresh_storage_status()
-    return storage_status
+def _upload_status_text():
+    """OLEDフッター2段目向け。録音の最終保存先（GDRIVE_DIR）へのアップロード状況を返す。"""
+    if upload_queue.unfinished_tasks:
+        return "GDRIVE UPLOADING"
+    if upload_last_failed:
+        return "GDRIVE UPLOAD ERR"
+    return "SAVE: SD -> GDRIVE"
 
 
 def _oled_lines():
@@ -343,16 +412,16 @@ def _oled_lines():
             _stop_radio_locked(unexpected=True)
         now = datetime.now()
         if keyboard_error:
-            return (now.strftime("%Y-%m-%d %H:%M"), "CONFIG ERROR", keyboard_error, _cached_storage_status(), _cpu_temperature_text(), True, _sd_free_text())
+            return (now.strftime("%Y-%m-%d %H:%M"), "CONFIG ERROR", keyboard_error, _upload_status_text(), _cpu_temperature_text(), True, _sd_free_text())
         if record_process is not None:
             elapsed = max(0, int((now - recording_started_at).total_seconds()))
             hours, remainder = divmod(elapsed, 3600)
             minutes, seconds = divmod(remainder, 60)
             rec_visible = int(time.monotonic() / REC_BLINK_SECONDS) % 2 == 0
-            return (now.strftime("%Y-%m-%d %H:%M"), "RECORDING", f"TIME {hours:02}:{minutes:02}:{seconds:02}", _cached_storage_status(), _cpu_temperature_text(), rec_visible, _sd_free_text())
+            return (now.strftime("%Y-%m-%d %H:%M"), "RECORDING", f"TIME {hours:02}:{minutes:02}:{seconds:02}", _upload_status_text(), _cpu_temperature_text(), rec_visible, _sd_free_text())
         if radio_process is not None:
             label = "MP3 LOOP" if current_station.get("kind") == "mp3" else "RADIO PLAYING"
-            return (now.strftime("%Y-%m-%d %H:%M"), label, _oled_station_name(current_station), _cached_storage_status(), _cpu_temperature_text(), True, _sd_free_text())
+            return (now.strftime("%Y-%m-%d %H:%M"), label, _oled_station_name(current_station), _upload_status_text(), _cpu_temperature_text(), True, _sd_free_text())
         if spotify_current_source is not None:
             index = spotify_current_source.get("number", "?")
             total = len(spotify_sources)
@@ -361,8 +430,8 @@ def _oled_lines():
                 detail = f"{spotify_now_playing['track']} - {spotify_now_playing['artist']}"
             else:
                 detail = spotify_current_source["name"]
-            return (now.strftime("%Y-%m-%d %H:%M"), label, detail, _cached_storage_status(), _cpu_temperature_text(), True, _sd_free_text())
-        return (now.strftime("%Y-%m-%d %H:%M"), "STANDBY", "VOICE CONTROL", _cached_storage_status(), _cpu_temperature_text(), True, _sd_free_text())
+            return (now.strftime("%Y-%m-%d %H:%M"), label, detail, _upload_status_text(), _cpu_temperature_text(), True, _sd_free_text())
+        return (now.strftime("%Y-%m-%d %H:%M"), "STANDBY", "VOICE CONTROL", _upload_status_text(), _cpu_temperature_text(), True, _sd_free_text())
 
 
 def oled_worker():
@@ -388,19 +457,10 @@ def oled_worker():
                     while text and draw.textbbox((0, 0), text, font=name_font)[2] > 124:
                         text = text[:-1]
                     draw.text((2, 31), text, font=name_font, fill="white")
-                    # フッターは2段：1段目にCPU温度とmicroSD空き、2段目に録音先SSDの空き/総容量。
+                    # フッターは2段：1段目にCPU温度とmicroSD空き、2段目にGoogle Driveへのアップロード状況。
                     draw.text((2, 46), lines[4], font=footer_font, fill="white")
                     draw.text((126, 46), lines[6], font=footer_font, fill="white", anchor="ra")
-                    storage = lines[3]
-                    if not storage["mounted"]:
-                        storage_text = "SSD: NOT MOUNTED"
-                    elif storage["low"]:
-                        storage_text = "SSD LOW SPACE"
-                    else:
-                        storage_text = f"SSD {storage['free_gib']:.1f}/{storage['total_gib']:.0f}GB"
-                        if draw.textbbox((0, 0), storage_text, font=footer_font)[2] > 124:
-                            storage_text = f"SSD {storage['free_gib']:.0f}GB"
-                    draw.text((2, 54), storage_text, font=footer_font, fill="white")
+                    draw.text((2, 54), lines[3], font=footer_font, fill="white")
                 previous = lines
             shutdown_event.wait(0.5)
     except Exception:
@@ -408,7 +468,8 @@ def oled_worker():
 
 
 def upload_worker():
-    global upload_process
+    """アップロード成否にかかわらずローカルの録音ファイルは削除しない（失敗時は手動で再アップロードできる）。"""
+    global upload_process, upload_last_failed
     while True:
         item = upload_queue.get()
         filepath = None
@@ -430,11 +491,14 @@ def upload_worker():
                 upload_process = process
             code = process.wait()
             if code:
-                log.error("アップロード失敗 %s: 終了コード %s", filepath, code)
+                upload_last_failed = True
+                log.error("アップロード失敗 %s: 終了コード %s（ローカルに残します）", filepath, code)
             else:
+                upload_last_failed = False
                 log.info("アップロード完了: %s", filepath)
         except OSError:
-            log.exception("アップロード実行エラー: %s", filepath)
+            upload_last_failed = True
+            log.exception("アップロード実行エラー: %s（ローカルに残します）", filepath)
         finally:
             with upload_lock:
                 if process is not None and upload_process is process and process.poll() is not None:
@@ -470,7 +534,6 @@ def _close_file(upload=True):
     if upload and filepath:
         with upload_lock:
             upload_queue.put((filepath, upload_generation))
-    _refresh_storage_status()
 
 
 def write_recording(process):
@@ -630,13 +693,6 @@ def start_recording():
         _reconcile_recording()
         if record_process is not None:
             return False, "すでに録音中です"
-        status = _refresh_storage_status()
-        if not status["mounted"]:
-            log.error("SSD (%s) が未マウントのため録音を開始できません", SSD_MOUNT_POINT)
-            return False, "SSDが接続されていないため録音を開始できません"
-        if status["low"]:
-            log.error("SSDの空き容量不足のため録音を開始できません（残り %.2fGB）", status["free_gib"])
-            return False, "SSDの空き容量が不足しているため録音を開始できません"
         _stop_radio_locked()
         stop_spotify()
         try:
@@ -715,6 +771,14 @@ def toggle_recording():
             start_recording()
         else:
             stop_recording()
+
+
+def stop_playback():
+    """録音・アップロードには触れず、再生枠（ラジオ/MP3）とSpotifyだけを既存の停止処理で止める。"""
+    with control_lock:
+        stopped_radio = stop_radio()
+        stopped_spotify = stop_spotify()
+    return stopped_radio or stopped_spotify
 
 
 # ---- IR remote（学習・送信）----
@@ -1131,6 +1195,275 @@ def spotify_poll_worker():
             }
 
 
+# ---- スケジューラー（時刻指定実行）----
+# 専用の再生・録音・IR処理は持たず、キーボード・Web UIと同じ既存関数を同一プロセス内で呼ぶ。
+# スケジュールの状態もcontrol_lockで保護し、実行（IR送信等のブロッキング処理）はロック外で行う。
+
+
+def _schedule_stations():
+    """キーボードと同様にstations.confを読み直す。壊れている場合は起動時の一覧を使う。"""
+    try:
+        return load_stations()
+    except (OSError, ValueError, configparser.Error):
+        return stations
+
+
+def _schedule_spotify_sources():
+    """Ctrl+2と同様にspotify_sources.jsonを読み直す。壊れている場合は現在の一覧を使う。"""
+    try:
+        return load_spotify_sources()
+    except (OSError, ValueError):
+        return spotify_sources
+
+
+def _schedule_matches(task, minute):
+    """minute（秒以下を0にしたローカル時刻）にtaskの予定があるか。有効/無効は見ない。"""
+    if task["time"] != minute.strftime("%H:%M"):
+        return False
+    if task["repeat"] == "weekly":
+        return minute.weekday() in task["weekdays"]
+    if task["repeat"] == "once":
+        return task["date"] == minute.date().isoformat()
+    return True
+
+
+def _schedule_target_label(task, station_list=None):
+    action = task["action"]
+    target = task["target"]
+    if action == "radio":
+        station = next((item for item in (station_list or _schedule_stations())
+                        if item["number"] == target), None)
+        return station["name"] if station else f"不明な局 No.{target}"
+    if action == "ir":
+        return ir_codes[target]["name"] if target in ir_codes else f"不明なIR No.{target}"
+    if action == "mp3":
+        return target
+    if action == "spotify":
+        source = next((item for item in _schedule_spotify_sources() if item["spotify_id"] == target), None)
+        return source["name"] if source else "不明なSpotify再生リスト"
+    return ""
+
+
+def _execute_schedule_action(task):
+    """スケジュール1件を既存のコア処理へ振り分ける。戻り値は (ok, message)。"""
+    action = task["action"]
+    target = task["target"]
+    if action == "radio":
+        try:
+            station = next((item for item in load_stations() if item["number"] == target), None)
+        except (OSError, ValueError, configparser.Error) as exc:
+            return False, f"stations.confを読み込めません: {exc}"
+        if station is None:
+            return False, f"局番号 {target} が存在しません"
+        return start_radio(station, toggle=False)
+    if action == "mp3":
+        if target != MP3_NAME:
+            return False, f"音楽が見つかりません: {target}"
+        return start_mp3()
+    if action == "spotify":
+        try:
+            source = next((item for item in load_spotify_sources() if item["spotify_id"] == target), None)
+        except (OSError, ValueError) as exc:
+            return False, f"spotify_sources.jsonを読み込めません: {exc}"
+        if source is None:
+            return False, "Spotify再生リストが見つかりません"
+        return start_spotify(source)
+    if action == "ir":
+        return send_ir(target)
+    if action == "record_start":
+        return start_recording()
+    if action == "record_stop":
+        return True, "録音を停止しました" if stop_recording() else "録音していません"
+    if action == "playback_stop":
+        return True, "再生を停止しました" if stop_playback() else "再生していません"
+    return False, f"不明な機能です: {action}"
+
+
+def run_due_schedules(now=None):
+    """前回確認時刻からnowまでに予定時刻を迎えたタスクを実行する。
+    - 起動直後の初回呼び出しは基準時刻を記録するだけ（再起動前の予定は実行しない）。
+    - 時刻が大きく飛んだ場合（NTP補正等）もSCHEDULE_CATCHUP_SECONDS以上は遡らない。
+    - 実行前にlast_runを保存し、同じ予定時刻を二度実行しない（時刻の巻き戻りや異常終了でも）。"""
+    global scheduler_last_checked
+    now = now or datetime.now()
+    with control_lock:
+        previous = scheduler_last_checked
+        scheduler_last_checked = now
+        if previous is None or shutdown_event.is_set():
+            return []
+        oldest = now - timedelta(seconds=SCHEDULE_CATCHUP_SECONDS)
+        if previous < oldest:
+            log.warning("[Scheduler] 時刻が %s から %s へ飛んだため、%s秒より前の予定は実行しません",
+                        previous, now, SCHEDULE_CATCHUP_SECONDS)
+        start = max(previous, oldest)
+        due = []
+        minute = start.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        while minute <= now:
+            key = minute.strftime("%Y-%m-%dT%H:%M")
+            for number in sorted(schedules):
+                task = schedules[number]
+                if task["enabled"] and task.get("last_run") != key and _schedule_matches(task, minute):
+                    task["last_run"] = key
+                    due.append((minute, dict(task)))
+            minute += timedelta(minutes=1)
+        if not due:
+            return []
+        due.sort(key=lambda item: (item[0], SCHEDULE_ACTIONS.index(item[1]["action"]), item[1]["id"]))
+        try:
+            _save_schedules()
+        except OSError:
+            log.exception("[Scheduler] 実行記録を保存できません")
+    results = []
+    previous_action = None
+    for minute, task in due:
+        if task["action"] == "ir" and previous_action == "ir":
+            shutdown_event.wait(SCHEDULE_IR_GAP_SECONDS)
+        previous_action = task["action"]
+        log.info("[Scheduler] 実行: No.%s %s %s %s", task["id"], task["time"],
+                 SCHEDULE_ACTION_LABELS[task["action"]], task["target"] or "")
+        try:
+            ok, message = _execute_schedule_action(task)
+        except Exception as exc:
+            log.exception("[Scheduler] 実行中にエラーが発生しました: No.%s", task["id"])
+            ok, message = False, str(exc)
+        if ok:
+            log.info("[Scheduler] 完了: No.%s %s", task["id"], message)
+        else:
+            log.error("[Scheduler] 失敗: No.%s %s", task["id"], message)
+        results.append((task["id"], ok, message))
+        with control_lock:
+            current = schedules.get(task["id"])
+            if current is None:
+                continue  # 実行中に削除された
+            current["last_result"] = {"ok": ok, "message": message,
+                                      "at": datetime.now().isoformat(timespec="seconds")}
+            # 実行中に日時を編集された場合は、編集後の予定を削除しない。
+            if ok and current["repeat"] == "once" and _schedule_matches(current, minute):
+                del schedules[task["id"]]
+                log.info("[Scheduler] 1回のみのタスク No.%s を完了したため削除しました", task["id"])
+            try:
+                _save_schedules()
+            except OSError:
+                log.exception("[Scheduler] 実行結果を保存できません")
+    return results
+
+
+def scheduler_worker():
+    """毎分0秒直後に一度だけ起きて期限到来タスクを確認する（busy loopにしない）。"""
+    while not shutdown_event.is_set():
+        try:
+            run_due_schedules()
+        except Exception:
+            log.exception("[Scheduler] スケジュール確認に失敗しました")
+        now = datetime.now()
+        delay = 60 - now.second - now.microsecond / 1_000_000 + 0.2
+        shutdown_event.wait(max(0.2, delay))
+
+
+def list_schedules():
+    with control_lock:
+        station_list = _schedule_stations()
+        tasks = []
+        for number in sorted(schedules, key=lambda n: (schedules[n]["time"], n)):
+            task = dict(schedules[number])
+            task["action_label"] = SCHEDULE_ACTION_LABELS[task["action"]]
+            task["target_label"] = _schedule_target_label(task, station_list)
+            tasks.append(task)
+        options = {
+            "stations": [{"value": item["number"], "name": item["name"]} for item in station_list],
+            "mp3": [{"value": MP3_NAME, "name": MP3_NAME}],
+            "spotify": [{"value": item["spotify_id"], "name": f"{item['number']}. {item['name']}"}
+                        for item in _schedule_spotify_sources()],
+            "ir": [{"value": number, "name": ir_codes[number]["name"]} for number in sorted(ir_codes)],
+        }
+    return {"tasks": tasks, "options": options, "now": datetime.now().strftime("%Y-%m-%d %H:%M")}
+
+
+def _check_once_in_future(task):
+    if task["enabled"] and task["repeat"] == "once":
+        scheduled = datetime.fromisoformat(f"{task['date']}T{task['time']}")
+        if scheduled <= datetime.now():
+            raise ValueError("過去の日時は指定できません")
+
+
+def create_schedule(data):
+    global schedule_next_id
+    with control_lock:
+        try:
+            task = _normalize_schedule(data)
+            _check_once_in_future(task)
+        except ValueError as exc:
+            return False, str(exc), None
+        number = schedule_next_id
+        task.update(id=number, last_run=None, last_result=None)
+        schedules[number] = task
+        schedule_next_id = number + 1
+        try:
+            _save_schedules()
+        except OSError as exc:
+            del schedules[number]
+            schedule_next_id = number
+            return False, f"スケジュールを保存できません: {exc}", None
+        log.info("[Scheduler] 登録: No.%s", number)
+        return True, "スケジュールを登録しました", task
+
+
+def update_schedule(number, data):
+    with control_lock:
+        previous = schedules.get(number)
+        if previous is None:
+            return False, "指定したスケジュールが見つかりません", None
+        try:
+            task = _normalize_schedule(data)
+            _check_once_in_future(task)
+        except ValueError as exc:
+            return False, str(exc), None
+        task.update(id=number, last_run=previous.get("last_run"),
+                    last_result=previous.get("last_result"))
+        schedules[number] = task
+        try:
+            _save_schedules()
+        except OSError as exc:
+            schedules[number] = previous
+            return False, f"スケジュールを保存できません: {exc}", None
+        log.info("[Scheduler] 更新: No.%s", number)
+        return True, "スケジュールを更新しました", task
+
+
+def set_schedule_enabled(number, enabled):
+    with control_lock:
+        previous = schedules.get(number)
+        if previous is None:
+            return False, "指定したスケジュールが見つかりません"
+        task = dict(previous, enabled=enabled)
+        try:
+            _check_once_in_future(task)
+        except ValueError as exc:
+            return False, f"{exc}（編集で日時を変更してください）"
+        schedules[number] = task
+        try:
+            _save_schedules()
+        except OSError as exc:
+            schedules[number] = previous
+            return False, f"スケジュールを保存できません: {exc}"
+        log.info("[Scheduler] %s: No.%s", "有効化" if enabled else "無効化", number)
+        return True, "有効にしました" if enabled else "無効にしました"
+
+
+def delete_schedule(number):
+    with control_lock:
+        previous = schedules.pop(number, None)
+        if previous is None:
+            return False, "指定したスケジュールが見つかりません"
+        try:
+            _save_schedules()
+        except OSError as exc:
+            schedules[number] = previous
+            return False, f"スケジュールを保存できません: {exc}"
+        log.info("[Scheduler] 削除: No.%s", number)
+        return True, "スケジュールを削除しました"
+
+
 def get_volume():
     try:
         result = subprocess.run(
@@ -1220,6 +1553,26 @@ padding:6px;font:inherit;width:100%}
 .album-art{width:96px;height:96px;object-fit:cover;border:2px solid var(--line);margin-bottom:8px}
 #spotifySources,#spotifySearchResults{display:flex;flex-wrap:wrap;gap:8px}
 #spotifySources button,#spotifySearchResults button{width:auto;flex:1 1 auto;min-width:120px}
+select,input[type=time],input[type=date],input[type=datetime-local]{background:var(--bg);color:var(--text);border:1px solid var(--line);
+border-radius:0;padding:8px;font:inherit;font-size:16px;width:100%}
+.schedule-card{border:1px solid var(--line);padding:10px 12px;margin:8px 0}
+.schedule-card.disabled .schedule-body{opacity:.45}
+.schedule-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.schedule-time{font-size:20px;font-weight:700;color:var(--amber)}
+.schedule-meta{font-size:12px;color:var(--dim)}
+.schedule-meta.error{color:var(--red)}
+.btn-row{display:flex;gap:8px}
+.btn-row button{flex:1;margin:8px 0 0;padding:10px 4px;font-size:13px}
+.weekdays{display:flex;gap:4px}
+.weekdays label{flex:1;display:flex;flex-direction:column;align-items:center;margin:0;padding:6px 0;
+border:1px solid var(--line);color:var(--text);font-size:14px}
+.weekdays input{margin:6px 0 0;width:20px;height:20px}
+label.check-row{display:flex;align-items:center;gap:8px;color:var(--text);font-size:14px}
+label.check-row input{width:20px;height:20px;margin:0}
+#scheduleCancel[hidden]{display:none}
+input[type=time],input[type=date],input[type=datetime-local]{color-scheme:dark;min-height:44px;cursor:pointer}
+input::-webkit-calendar-picker-indicator{filter:invert(1);opacity:.8;cursor:pointer}
+@media (max-width:420px){.tab-btn{letter-spacing:0;font-size:11px;min-width:0;overflow:hidden}}
 .emergency-bar{position:fixed;left:0;right:0;bottom:0;padding:14px 16px;
 background:repeating-linear-gradient(45deg,#2a1010,#2a1010 12px,#160a0a 12px,#160a0a 24px);border-top:3px solid var(--red)}
 .emergency-bar button{border:2px solid var(--red);background:var(--red);color:#0d0f0d;font-weight:900;
@@ -1238,6 +1591,7 @@ letter-spacing:.1em;max-width:650px;margin:0 auto}
 <button class="tab-btn" data-tab="mp3" onclick="showTab('mp3')">MP3</button>
 <button class="tab-btn" data-tab="ir" onclick="showTab('ir')">IR</button>
 <button class="tab-btn" data-tab="spotify" onclick="showTab('spotify')">Spotify</button>
+<button class="tab-btn" data-tab="schedule" onclick="showTab('schedule')">予定</button>
 </nav>
 <div class="tab-panel" data-tab="record" hidden>
 <button class="start" onclick="postCommand('/api/record/start')">録音開始</button>
@@ -1275,6 +1629,30 @@ letter-spacing:.1em;max-width:650px;margin:0 auto}
 <div id="spotifySearchResults"></div>
 </div>
 </div>
+<div class="tab-panel" data-tab="schedule" hidden>
+<small class="schedule-meta" id="schedulePiTime"></small>
+<h2 style="margin-top:12px">登録済みスケジュール</h2>
+<div id="scheduleList"></div>
+<h2 id="scheduleFormTitle" style="margin-top:24px">新規登録</h2>
+<form id="scheduleForm" onsubmit="saveSchedule(event)" novalidate>
+<label for="scheduleRepeat">繰り返し</label>
+<select id="scheduleRepeat" onchange="updateScheduleForm()">
+<option value="once" selected>1回のみ（日時指定）</option><option value="daily">毎日</option><option value="weekly">曜日指定</option>
+</select>
+<div id="scheduleDateBox"><label for="scheduleDateTime">実行日時</label><input id="scheduleDateTime" type="datetime-local" step="60" placeholder="YYYY-MM-DD HH:MM"></div>
+<div id="scheduleTimeBox" hidden><label for="scheduleTime">実行時刻</label><input id="scheduleTime" type="time" placeholder="HH:MM"></div>
+<div id="scheduleWeekdaysBox" hidden><label>曜日</label><div class="weekdays" id="scheduleWeekdays"></div></div>
+<label for="scheduleAction">実行する機能</label>
+<select id="scheduleAction" onchange="updateScheduleForm()">
+<option value="radio">ラジオ再生</option><option value="mp3">MP3再生</option><option value="spotify">Spotify再生</option><option value="ir">IR送信</option>
+<option value="record_start">録音開始</option><option value="record_stop">録音停止</option><option value="playback_stop">再生停止（ラジオ・MP3・Spotify）</option>
+</select>
+<div id="scheduleTargetBox"><label for="scheduleTarget">対象</label><select id="scheduleTarget"></select></div>
+<label class="check-row"><input id="scheduleEnabled" type="checkbox" checked>有効</label>
+<button class="start" type="submit" id="scheduleSubmit">登録</button>
+<button type="button" id="scheduleCancel" onclick="resetScheduleForm()" hidden>編集をやめる</button>
+</form>
+</div>
 </main>
 <div class="emergency-bar"><button onclick="postCommand('/api/all/stop')">緊急停止（録音・ラジオ・MP3）</button></div>
 <script>
@@ -1282,6 +1660,7 @@ const byId=id=>document.getElementById(id);
 function showTab(name){
 document.querySelectorAll('.tab-panel').forEach(el=>{el.hidden=el.dataset.tab!==name;});
 document.querySelectorAll('.tab-btn').forEach(el=>{el.classList.toggle('active',el.dataset.tab===name);});
+if(name==='schedule')loadSchedules();
 }
 let lastIrCodesJson=null;
 function renameIr(number,name){postCommand('/api/ir/rename/'+number,{headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});}
@@ -1341,6 +1720,75 @@ for(const result of results){const button=document.createElement('button');butto
 button.textContent=result.name;
 button.onclick=()=>postCommand('/api/spotify/add_artist',{headers:{'Content-Type':'application/json'},body:JSON.stringify({name:result.name,spotify_id:result.spotify_id})});
 box.appendChild(button);}}
+const WEEKDAY_NAMES=['月','火','水','木','金','土','日'];
+let scheduleData={tasks:[],options:{stations:[],mp3:[],spotify:[],ir:[]},now:''};
+let editingScheduleId=null;let lastSchedulesJson=null;
+byId('scheduleWeekdays').innerHTML=WEEKDAY_NAMES.map((name,index)=>`<label>${name}<input type="checkbox" value="${index}"></label>`).join('');
+// 入力欄のどこをタップしてもブラウザ標準の日時ピッカーを開く（アイコンだけでなく）。
+for(const id of ['scheduleDateTime','scheduleTime']){const input=byId(id);
+input.addEventListener('click',()=>{if(input.showPicker){try{input.showPicker();}catch(error){}}});}
+function scheduleTargetOptions(action){const o=scheduleData.options;
+return action==='radio'?o.stations:action==='mp3'?o.mp3:action==='spotify'?o.spotify:action==='ir'?o.ir:null;}
+function updateScheduleForm(selectedTarget){const repeat=byId('scheduleRepeat').value;
+byId('scheduleWeekdaysBox').hidden=repeat!=='weekly';byId('scheduleDateBox').hidden=repeat!=='once';byId('scheduleTimeBox').hidden=repeat==='once';
+const dateTime=byId('scheduleDateTime'),time=byId('scheduleTime');
+if(repeat==='once'&&!dateTime.value&&time.value&&scheduleData.now)dateTime.value=scheduleData.now.slice(0,10)+'T'+time.value;
+if(repeat!=='once'&&!time.value&&dateTime.value)time.value=dateTime.value.slice(11,16);
+const action=byId('scheduleAction').value;const options=scheduleTargetOptions(action);
+byId('scheduleTargetBox').hidden=!options;if(!options)return;
+const select=byId('scheduleTarget');const key=action+JSON.stringify(options);
+const current=selectedTarget!==undefined?String(selectedTarget):select.value;
+if(select.dataset.key!==key){select.dataset.key=key;select.innerHTML='';
+for(const item of options){const option=document.createElement('option');option.value=item.value;option.textContent=item.name;select.appendChild(option);}
+if(!options.length){const option=document.createElement('option');option.value='';option.textContent='登録がありません';select.appendChild(option);}}
+if([...select.options].some(option=>option.value===current))select.value=current;}
+function scheduleWhen(task){return task.repeat==='daily'?'毎日':task.repeat==='weekly'?task.weekdays.map(day=>WEEKDAY_NAMES[day]).join('・'):task.date+'（1回のみ）';}
+function renderSchedules(){const json=JSON.stringify(scheduleData.tasks);if(json===lastSchedulesJson)return;lastSchedulesJson=json;
+const list=byId('scheduleList');list.innerHTML='';
+if(!scheduleData.tasks.length){const empty=document.createElement('small');empty.className='schedule-meta';empty.textContent='登録はありません';list.appendChild(empty);return;}
+for(const task of scheduleData.tasks){const card=document.createElement('div');card.className='schedule-card'+(task.enabled?'':' disabled');
+const body=document.createElement('div');body.className='schedule-body';
+const head=document.createElement('div');head.className='schedule-head';
+const time=document.createElement('span');time.className='schedule-time';time.textContent=task.time;
+const state=document.createElement('span');state.className='schedule-meta';state.textContent=(task.enabled?'有効':'無効')+' / No.'+task.id;
+head.append(time,state);
+const when=document.createElement('div');when.textContent=scheduleWhen(task);
+const what=document.createElement('div');what.textContent=task.action_label+(task.target_label?': '+task.target_label:'');
+body.append(head,when,what);
+if(task.last_result){const result=document.createElement('div');result.className='schedule-meta'+(task.last_result.ok?'':' error');
+result.textContent=(task.last_result.ok?'前回実行 ':'前回失敗 ')+task.last_result.at.replace('T',' ')+' '+task.last_result.message;body.appendChild(result);}
+const buttons=document.createElement('div');buttons.className='btn-row';
+const toggle=document.createElement('button');toggle.className=task.enabled?'stop':'start';toggle.textContent=task.enabled?'無効にする':'有効にする';
+toggle.onclick=()=>scheduleRequest('/api/schedules/'+task.id+'/enabled',{enabled:!task.enabled});
+const edit=document.createElement('button');edit.className='station';edit.textContent='編集';edit.onclick=()=>editSchedule(task);
+const remove=document.createElement('button');remove.className='stop';remove.textContent='削除';
+remove.onclick=()=>{if(confirm(`${task.time} ${task.action_label} を削除しますか？`))scheduleRequest('/api/schedules/'+task.id+'/delete');};
+buttons.append(toggle,edit,remove);card.append(body,buttons);list.appendChild(card);}}
+async function loadSchedules(){try{const response=await fetch('/api/schedules',{cache:'no-store'});const data=await response.json();
+if(!data.ok)return;scheduleData=data;byId('schedulePiTime').textContent='Raspberry Piの現在時刻: '+data.now;
+byId('scheduleDateTime').min=data.now.replace(' ','T');
+renderSchedules();updateScheduleForm();}catch(error){byId('schedulePiTime').textContent='スケジュールを取得できません';}}
+async function scheduleRequest(url,body){try{const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+const data=await response.json();if(!data.ok)alert(data.message||'操作に失敗しました');await loadSchedules();return data.ok;
+}catch(error){alert('サーバーと通信できません');return false;}}
+function resetScheduleForm(){editingScheduleId=null;byId('scheduleForm').reset();
+byId('scheduleFormTitle').textContent='新規登録';byId('scheduleSubmit').textContent='登録';byId('scheduleCancel').hidden=true;updateScheduleForm();}
+function editSchedule(task){editingScheduleId=task.id;byId('scheduleTime').value=task.time;byId('scheduleRepeat').value=task.repeat;
+byId('scheduleWeekdays').querySelectorAll('input').forEach(input=>{input.checked=task.weekdays.includes(Number(input.value));});
+byId('scheduleDateTime').value=task.date?task.date+'T'+task.time:'';byId('scheduleAction').value=task.action;byId('scheduleEnabled').checked=task.enabled;
+byId('scheduleFormTitle').textContent='No.'+task.id+' を編集';byId('scheduleSubmit').textContent='更新';byId('scheduleCancel').hidden=false;
+updateScheduleForm(task.target===null?undefined:task.target);byId('scheduleForm').scrollIntoView({behavior:'smooth'});}
+async function saveSchedule(event){event.preventDefault();const repeat=byId('scheduleRepeat').value;
+const dateTime=byId('scheduleDateTime').value.trim().replace(' ','T'),time=repeat==='once'?dateTime.slice(11,16):byId('scheduleTime').value.trim();
+if(repeat==='once'&&!/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}/.test(dateTime)){alert('実行日時を選択してください（例: 2026-10-01 07:00）');return;}
+if(!time){alert('実行時刻を入力してください');return;}
+const body={time,repeat,
+weekdays:[...byId('scheduleWeekdays').querySelectorAll('input:checked')].map(input=>Number(input.value)),
+date:repeat==='once'?dateTime.slice(0,10):null,action:byId('scheduleAction').value,
+target:byId('scheduleTargetBox').hidden?null:byId('scheduleTarget').value,enabled:byId('scheduleEnabled').checked};
+const url=editingScheduleId===null?'/api/schedules':'/api/schedules/'+editingScheduleId;
+if(await scheduleRequest(url,body))resetScheduleForm();}
+setInterval(()=>{if(!document.querySelector('.tab-panel[data-tab="schedule"]').hidden)loadSchedules();},10000);
 showTab('record');updateStatus();setInterval(updateStatus,1000);
 </script></body></html>"""
 
@@ -1494,6 +1942,52 @@ def web_spotify_add_artist():
         return jsonify(ok=False, message=f"再生リストを保存できません: {exc}"), 500
     ok, message = start_spotify(source)
     return jsonify(ok=ok, message=message, source=source), 200 if ok else 409
+
+
+def _schedule_number(value):
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+@app.get("/api/schedules")
+def web_schedules():
+    return jsonify(ok=True, **list_schedules())
+
+
+@app.post("/api/schedules")
+def web_schedule_create():
+    ok, message, task = create_schedule(request.get_json(silent=True))
+    return jsonify(ok=ok, message=message, task=task), 200 if ok else 400
+
+
+@app.post("/api/schedules/<number>")
+def web_schedule_update(number):
+    task_number = _schedule_number(number)
+    if task_number is None:
+        return jsonify(ok=False, message="番号は整数で指定してください"), 400
+    ok, message, task = update_schedule(task_number, request.get_json(silent=True))
+    return jsonify(ok=ok, message=message, task=task), 200 if ok else 400
+
+
+@app.post("/api/schedules/<number>/enabled")
+def web_schedule_enabled(number):
+    task_number = _schedule_number(number)
+    enabled = (request.get_json(silent=True) or {}).get("enabled")
+    if task_number is None or type(enabled) is not bool:
+        return jsonify(ok=False, message="番号または有効/無効の指定が不正です"), 400
+    ok, message = set_schedule_enabled(task_number, enabled)
+    return jsonify(ok=ok, message=message), 200 if ok else 400
+
+
+@app.post("/api/schedules/<number>/delete")
+def web_schedule_delete(number):
+    task_number = _schedule_number(number)
+    if task_number is None:
+        return jsonify(ok=False, message="番号は整数で指定してください"), 400
+    ok, message = delete_schedule(task_number)
+    return jsonify(ok=ok, message=message), 200 if ok else 400
 
 
 def handle_keyboard_key(number):
@@ -1721,6 +2215,7 @@ def configure_bluetooth_audio():
 
 def main():
     global record_led, ir_rx_led, ir_tx_led, upload_thread, oled_device, oled_thread, spotify_poll_thread
+    global scheduler_thread
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     def request_shutdown(signum, frame):
         log.info("終了シグナル: %s", signal.Signals(signum).name)
@@ -1734,14 +2229,10 @@ def main():
     server = None
     try:
         configure_bluetooth_audio()
-        status = _refresh_storage_status()
-        if status["mounted"]:
-            try:
-                SAVE_DIR.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                log.exception("録音保存先ディレクトリを作成できません: %s", SAVE_DIR)
-        else:
-            log.error("SSD (%s) が未マウントです。録音保存先 %s は作成しません", SSD_MOUNT_POINT, SAVE_DIR)
+        try:
+            SAVE_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            log.exception("録音保存先ディレクトリを作成できません: %s", SAVE_DIR)
         record_led = LED(RECORD_LED_GPIO)
         record_led.off()
         ir_rx_led = LED(IR_RX_LED_GPIO)
@@ -1754,6 +2245,8 @@ def main():
         upload_thread.start()
         spotify_poll_thread = threading.Thread(target=spotify_poll_worker, daemon=True)
         spotify_poll_thread.start()
+        scheduler_thread = threading.Thread(target=scheduler_worker, daemon=True)
+        scheduler_thread.start()
         try:
             from luma.core.interface.serial import i2c
             from luma.oled.device import ssd1309
@@ -1784,6 +2277,8 @@ def main():
             oled_thread.join(timeout=2)
         if spotify_poll_thread is not None:
             spotify_poll_thread.join(timeout=2)
+        if scheduler_thread is not None:
+            scheduler_thread.join(timeout=2)
 
 
 if __name__ == "__main__":

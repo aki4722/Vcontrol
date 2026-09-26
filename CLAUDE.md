@@ -51,7 +51,7 @@ manually in `setUp`.
 ## Architecture
 
 Everything lives in `listen.py` as one file with module-level mutable state guarded by a
-single `threading.RLock()` (`control_lock`). Three background threads plus the Flask
+single `threading.RLock()` (`control_lock`). Several background threads plus the Flask
 server (run via `werkzeug.serving.make_server`, polled in a loop instead of `app.run()`)
 share this state:
 
@@ -71,7 +71,16 @@ share this state:
   and a small JSON API (`/api/record/*`, `/api/radio/*`, `/api/mp3/*`, `/api/ir/*`,
   `/api/all/stop`, `/api/status`, `/api/volume`) that all funnel through the same
   functions the keyboard uses (`start_recording`, `stop_recording`, `start_radio`,
-  `stop_radio`, `start_mp3`, `emergency_stop`).
+  `stop_radio`, `start_mp3`, `emergency_stop`). `/api/schedules*` manages scheduled tasks.
+- **`scheduler_worker`** — wakes once just after each minute boundary (`shutdown_event.wait`,
+  no busy loop) and calls `run_due_schedules()`, which runs tasks from `schedules.json`
+  by calling the same core functions as keyboard/Web (`start_radio(toggle=False)`,
+  `start_mp3`, `start_spotify`, `send_ir`, `start_recording`, `stop_recording`, `stop_playback`). Schedule
+  state is guarded by `control_lock`; due tasks are marked (`last_run`, persisted) under
+  the lock, then executed *outside* it. First tick after startup only records a baseline,
+  and it never looks back more than `SCHEDULE_CATCHUP_SECONDS`, so past-due tasks don't
+  fire after a restart or NTP jump. See README「スケジュール」 for the exact rules.
+- `spotify_poll_worker` polls now-playing info while Spotify is active.
 
 **Radio, MP3-loop, and recording are mutually exclusive** and share one "playback slot"
 (`radio_process`/`radio_pgid`/`current_station`) — starting one stops whatever is

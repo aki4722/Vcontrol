@@ -1,6 +1,6 @@
 # 録音・ラジオ操作
 
-音声認識ライブラリは使用しません。録音時は ALSA の `arecord` を起動し、WAV ファイルを USB SSD 上の `/mnt/ssd/voice` に保存します（`RECORDINGS_DIR` で変更可能）。SSD は起動時に `/mnt/ssd` へ自動マウントされる前提で、録音開始前に `os.path.ismount("/mnt/ssd")` に加えて実際に `/mnt/ssd/voice` へ小さなファイルを書き込めるかも確認し（マウント表には残っているがUSB切断等でデバイス自体が消えた「幽霊マウント」を、空き容量取得だけでは検知できないため）、いずれかに失敗した場合は録音を開始せずエラーを記録します（マウントポイントは `SSD_MOUNT_POINT` で変更可能）。この書き込み確認はデバイス切断直後に長時間ブロックすることがあるため、タイムアウト付き（既定2秒、`SSD_PROBE_TIMEOUT_SECONDS`定数）で行います。録音終了時と1時間ごとの分割時に `rclone` で `gdrive:音声` へアップロードします。ラジオは `play_radiko.sh` を使用します。
+音声認識ライブラリは使用しません。録音時は ALSA の `arecord` を起動し、WAV ファイルをまず Raspberry Pi 本体（microSD）の `/home/akimoto/recordings` に保存します（`RECORDINGS_DIR` で変更可能）。Google Driveへ直接ストリーミング保存はしません。録音終了時と1時間ごとの分割時に、完成したファイルを `rclone copyto` で `gdrive:音声`（`GDRIVE_DIR`）へアップロードします。アップロード後もローカルのWAVは削除しません（成功・失敗とも残ります。失敗した場合は自動再試行しないため、必要に応じて手動で `rclone copyto` してください）。外付けSSDの有無は録音の可否に影響しません。ラジオは `play_radiko.sh` を使用します。
 
 ## キーボード操作
 
@@ -207,6 +207,74 @@ HTTP APIは以下を提供します。いずれもWeb画面と同じ共通処理
 | `POST /api/ir/send/<番号>` | 指定したIR番号を送信 |
 | `POST /api/ir/rename/<番号>` | 指定したIR番号の名前を変更（JSON body `{"name": "..."}`） |
 
+## スケジュール（時刻指定実行）
+
+Web画面の「予定」タブから、指定した時刻に既存の機能を自動実行するタスクを登録できます。
+スケジューラーは `listen.py` のプロセス内のバックグラウンドスレッドとして動作し、
+キーボード・Web操作と同じ関数（`start_radio`・`start_mp3`・`send_ir`・
+`start_spotify`・`start_recording`・`stop_recording`・`stop_radio`/`stop_spotify`）を直接呼び出します。
+そのため排他制御（録音中はラジオ・MP3を開始しない、ラジオとSpotifyは同時に鳴らさない等）は
+手動操作とまったく同じです。時刻はRaspberry Piのローカル時刻を使用します。
+
+| 機能 | 対象 | 呼び出す既存処理 |
+| --- | --- | --- |
+| ラジオ再生 | `stations.conf` の局（局番号で保存） | `start_radio(局, toggle=False)`（Ctrl+1と同じく、同じ局が再生中なら止めない。選局Noも保存） |
+| MP3再生 | 現在は `04-アクセル.mp3` のみ | `start_mp3()` |
+| Spotify再生 | `spotify_sources.json` の再生リスト（並び順で番号が変わるため `spotify_id` で保存） | Ctrl+2と同じくファイルを読み直して `start_spotify(再生リスト)` |
+| IR送信 | 登録済みIR番号 | `send_ir(番号)` |
+| 録音開始 | なし | `start_recording()` |
+| 録音停止 | なし | `stop_recording()` |
+| 再生停止 | なし | `stop_playback()`（`stop_radio()` + `stop_spotify()`。録音・アップロードには触れない） |
+
+繰り返しは「1回のみ」「毎日」「曜日指定」から選びます。1回のみは実行日時の入力欄を
+タップするとブラウザ標準のカレンダー（日時ピッカー）が開き、日付と時刻をまとめて選べます
+（Piの現在時刻より前は選べません）。毎日・曜日指定は時刻のみを入力します。
+登録済みタスクは一覧から有効/無効の切替・編集・削除ができます。
+1回のみのタスクは正常に実行されると自動的に一覧から削除されます（失敗した場合は残し、
+前回結果にエラーを表示します）。起動時にも、正常実行済みの1回のみのタスクが残っていれば削除します。各タスクの前回実行日時と結果（失敗理由を含む）は
+一覧に表示され、ログにも `[Scheduler]` として記録されます。
+
+実行ルール:
+
+- 毎分0秒の直後に一度だけ確認します（常時ループはしません）。
+- サービス起動時点より前の予定は実行しません（再起動中に過ぎた予定は実行されません）。
+- NTPによる時刻補正などで時計が大きく進んだ場合も、90秒より前の予定までは遡りません。
+- 各タスクは予定日時（年月日+時分）ごとに1回だけ実行します。実行前に記録するため、
+  時刻の巻き戻りや実行中の異常終了があっても同じ予定を二度実行しません。
+- 同じ時刻に複数のタスクがある場合は「再生停止 → 録音停止 → IR送信 → 録音開始 →
+  ラジオ再生 → MP3再生 → Spotify再生」の順に1件ずつ実行します（同順位は番号順）。例えばIRで
+  スピーカーの電源を入れてからラジオを再生する、といった登録が同じ時刻でも成立します。
+  ただし録音開始とラジオ再生を同時刻にすると、既存仕様どおりラジオは「録音中」で失敗します。
+- Spotifyは既存の `start_spotify()` と同じく、Web APIへの再生指示を別スレッドで行います。
+  そのため前回結果の「成功」は再生指示の開始を意味し、librespot未検出などその後のエラーは
+  既存のSpotify状態欄（Web UI・OLED）に表示されます。
+- 実行時点で局やIR番号・Spotify再生リストが削除されていた場合、録音中でラジオを開始できない場合などは
+  そのタスクだけ失敗として記録し、他のタスクやサービス全体には影響しません。
+- Ctrl+8・Webの緊急停止はスケジュール自体には影響しません（登録内容は残ります）。
+
+登録内容は `schedules.json`（`listen.py`と同じディレクトリ、JSON）に保存され、
+サービスやRaspberry Piを再起動しても保持されます。保存は他の状態ファイルと同じく
+`.tmp` へ書いてから置き換える原子的更新です。ファイルが壊れていた場合は
+`schedules.json.broken` へ退避して空の状態で起動します。
+
+HTTP API（Web画面と同じ共通処理を呼ぶ薄いラッパー）:
+
+| メソッド・パス | 内容 |
+| --- | --- |
+| `GET /api/schedules` | 一覧・選択肢（局/MP3/IR）・Piの現在時刻 |
+| `POST /api/schedules` | 新規登録（JSON body、下記） |
+| `POST /api/schedules/<番号>` | 更新（JSON body、下記） |
+| `POST /api/schedules/<番号>/enabled` | 有効/無効切替（`{"enabled": true}`） |
+| `POST /api/schedules/<番号>/delete` | 削除 |
+
+```json
+{"time": "07:00", "repeat": "weekly", "weekdays": [0, 1, 2, 3, 4],
+ "action": "radio", "target": 2, "enabled": true}
+```
+
+`repeat` は `daily` / `weekly`（`weekdays` は0=月〜6=日）/ `once`（`date` に `YYYY-MM-DD`）、
+`action` は `radio` / `mp3` / `spotify`（`target` に `spotify_id`）/ `ir` / `record_start` / `record_stop` / `playback_stop` です。
+
 ## セットアップ
 
 ```sh
@@ -257,11 +325,11 @@ venv/bin/python oled_test.py --address 0x3c
 このテストは独立したプログラムで、既存の録音・ラジオ常駐サービスには影響しません。
 
 常駐サービスではOLEDに現在時刻、CPU温度と `STANDBY`、`RECORDING`、`RADIO PLAYING` の状態を
-自動表示します。CPU温度、microSD（`/`）とSSD（`/mnt/ssd`）の空き容量はそれぞれ30秒ごとに更新され、
-画面下部の2段に分けて表示されます。1段目は `CPU 45c`（左）と `SD 12G`（右、microSDの空き容量）、
-2段目は録音先SSDの `SSD 83.4/111GB`（空き/総容量、幅に収まらない場合は `SSD 83GB` に短縮）です。
-SSDが未マウントの場合は2段目が `SSD: NOT MOUNTED`、空き容量が1GB未満の場合は `SSD LOW SPACE` となり、
-この状態では新規録音を開始できません（microSD側の空き容量は表示のみで録音開始の可否には影響しません）。
+自動表示します。画面下部は2段で、1段目は `CPU 45c`（左）と `SD 12G`（右、録音の一時保存先でもある
+microSDの空き容量。CPU温度とともに30秒ごとに更新）です。2段目は録音の最終保存先Google Driveへの
+アップロード状況で、通常は `SAVE: SD -> GDRIVE`、アップロード待ち・実行中は `GDRIVE UPLOADING`、
+直近のアップロードが失敗した場合は `GDRIVE UPLOAD ERR`（次のアップロード成功で戻る）を表示します。
+いずれも表示のみで、録音開始の可否には影響しません。
 録音中は経過時間、ラジオ再生中は一覧の `name` を
 表示し、`RECORDING` は0.5秒間隔で点滅します。
 I2Cバスとアドレスは `.env` の `OLED_PORT`、`OLED_ADDRESS` で変更できます。
@@ -271,7 +339,7 @@ OLEDが未接続または故障していても、録音・ラジオ機能は継�
 Bluetoothスピーカーなど出力先を固定する場合は `mpv --audio-device=help` で名前を
 確認し、`.env` に `MPV_AUDIO_DEVICE=pipewire/bluez_output...` を設定してください。
 
-設定可能な環境変数は `WEB_HOST`、`WEB_PORT`、`RECORDINGS_DIR`、`SSD_MOUNT_POINT`、`GDRIVE_DIR`、`OLED_PORT`、`OLED_ADDRESS`、`SPOTIFY_CLIENT_ID`、`SPOTIFY_CLIENT_SECRET`、`SPOTIFY_REFRESH_TOKEN`、`SPOTIFY_DEVICE_NAME` です。放送局は `stations.conf` に番号付きINI形式で登録します。radiko プレミアムを使う場合の資格情報は既存の `.env` に設定します。Spotifyのセットアップは「Spotify再生」の章を参照してください。
+設定可能な環境変数は `WEB_HOST`、`WEB_PORT`、`RECORDINGS_DIR`、`GDRIVE_DIR`、`OLED_PORT`、`OLED_ADDRESS`、`SPOTIFY_CLIENT_ID`、`SPOTIFY_CLIENT_SECRET`、`SPOTIFY_REFRESH_TOKEN`、`SPOTIFY_DEVICE_NAME` です。放送局は `stations.conf` に番号付きINI形式で登録します。radiko プレミアムを使う場合の資格情報は既存の `.env` に設定します。Spotifyのセットアップは「Spotify再生」の章を参照してください。
 
 ## 起動時のJQ-BTプロファイル設定
 

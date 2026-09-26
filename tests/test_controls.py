@@ -43,6 +43,7 @@ class ControlsTest(unittest.TestCase):
         app.writer_thread = None
         app.record_led = Mock()
         app.upload_process = None
+        app.upload_last_failed = False
         app.radio_error = None
         app.keyboard_error = None
         while not app.upload_queue.empty():
@@ -67,6 +68,13 @@ class ControlsTest(unittest.TestCase):
         app.spotify_token_expiry = 0.0
         app.spotify_device_id = None
         app.spotify_configured_warned = False
+        self.schedules_file = Path(directory.name) / 'schedules.json'
+        patcher = patch.object(app, 'SCHEDULES_FILE', self.schedules_file)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        app.schedules = {}
+        app.schedule_next_id = 1
+        app.scheduler_last_checked = None
         patcher = patch.multiple(app, SPOTIFY_CLIENT_ID='client-id', SPOTIFY_CLIENT_SECRET='secret',
                                   SPOTIFY_REFRESH_TOKEN='refresh-token')
         patcher.start()
@@ -182,8 +190,6 @@ class ControlsTest(unittest.TestCase):
                      pid=123, stdout=None, poll=Mock(return_value=None))), \
                  patch.object(app, '_terminate_group') as stop, \
                  patch.object(app, '_open_file'), patch.object(app, 'SAVE_DIR'), \
-                 patch.object(app, '_refresh_storage_status', return_value={
-                     'mounted': True, 'free_gib': 100.0, 'total_gib': 200.0, 'low': False}), \
                  patch.object(app.threading, 'Thread'):
                 app.record_process = None
                 app.start_mp3()
@@ -226,87 +232,50 @@ class ControlsTest(unittest.TestCase):
         order = []
         with patch.object(app, '_stop_radio_locked', side_effect=lambda: order.append('stop')), \
              patch.object(app, '_open_file'), patch.object(app, 'SAVE_DIR'), \
-             patch.object(app, '_refresh_storage_status', return_value={
-                 'mounted': True, 'free_gib': 100.0, 'total_gib': 200.0, 'low': False}), \
              patch.object(app.threading, 'Thread'), \
              patch.object(app.subprocess, 'Popen', side_effect=lambda *a, **k: order.append('record') or Mock()):
             self.assertTrue(app.start_recording()[0])
         self.assertEqual(order, ['stop', 'record'])
 
-    def test_recording_blocked_when_ssd_not_mounted(self):
-        with patch.object(app.os.path, 'ismount', return_value=False), \
-             patch.object(app.subprocess, 'Popen') as spawn, \
-             self.assertLogs(app.log, level='ERROR'):
+    def test_recording_starts_without_ssd(self):
+        """SSDの有無は録音可否に影響しない。保存先はローカルのSAVE_DIR。"""
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(app, 'SAVE_DIR', Path(directory) / 'recordings'), \
+             patch.object(app.os.path, 'ismount', return_value=False), \
+             patch.object(app, '_stop_radio_locked'), \
+             patch.object(app.threading, 'Thread'), \
+             patch.object(app.subprocess, 'Popen', return_value=Mock()) as spawn:
             ok, message = app.start_recording()
-        self.assertFalse(ok)
-        spawn.assert_not_called()
-        self.assertIsNone(app.record_process)
+            self.assertTrue(ok, message)
+            spawn.assert_called_once()
+            self.assertEqual(app.current_filepath.parent, Path(directory) / 'recordings')
+            app.wav_file.close()
+            app.wav_file = None
+            app.current_filepath = None
 
-    def test_recording_blocked_when_ssd_space_low(self):
-        usage = SimpleNamespace(free=int(0.5 * 1024 ** 3), total=100 * 1024 ** 3)
-        with patch.object(app.os.path, 'ismount', return_value=True), \
-             patch.object(app, '_probe_ssd_write', return_value=True), \
-             patch.object(app.shutil, 'disk_usage', return_value=usage), \
-             patch.object(app.subprocess, 'Popen') as spawn, \
-             self.assertLogs(app.log, level='ERROR'):
-            ok, message = app.start_recording()
-        self.assertFalse(ok)
-        spawn.assert_not_called()
-        self.assertIsNone(app.record_process)
-
-    def test_recording_blocked_when_ssd_write_probe_fails(self):
-        """マウント表には残っているがデバイスが切断された「幽霊マウント」を検知する。"""
-        with patch.object(app.os.path, 'ismount', return_value=True), \
-             patch.object(app, '_probe_ssd_write', return_value=False), \
-             patch.object(app.subprocess, 'Popen') as spawn, \
-             self.assertLogs(app.log, level='ERROR'):
-            ok, message = app.start_recording()
-        self.assertFalse(ok)
-        spawn.assert_not_called()
-        self.assertIsNone(app.record_process)
-
-    def test_refresh_storage_status_not_mounted(self):
-        with patch.object(app.os.path, 'ismount', return_value=False):
-            status = app._refresh_storage_status()
-        self.assertFalse(status['mounted'])
-        self.assertIsNone(status['free_gib'])
-
-    def test_refresh_storage_status_write_probe_failure_reports_not_mounted(self):
-        with patch.object(app.os.path, 'ismount', return_value=True), \
-             patch.object(app, '_probe_ssd_write', return_value=False):
-            status = app._refresh_storage_status()
-        self.assertFalse(status['mounted'])
-        self.assertIsNone(status['free_gib'])
-
-    def test_refresh_storage_status_mounted(self):
-        usage = SimpleNamespace(free=2 * 1024 ** 3, total=10 * 1024 ** 3)
-        with patch.object(app.os.path, 'ismount', return_value=True), \
-             patch.object(app, '_probe_ssd_write', return_value=True), \
-             patch.object(app.shutil, 'disk_usage', return_value=usage):
-            status = app._refresh_storage_status()
-        self.assertTrue(status['mounted'])
-        self.assertAlmostEqual(status['free_gib'], 2.0)
-
-    def test_probe_ssd_write_creates_and_removes_temp_file(self):
+    def test_upload_success_and_failure_keep_local_file(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(app, 'SAVE_DIR', Path(directory) / 'voice'):
-                self.assertTrue(app._probe_ssd_write())
-            self.assertEqual(list((Path(directory) / 'voice').iterdir()), [])
+            filepath = Path(directory) / 'rec.wav'
+            filepath.write_bytes(b'data')
+            for code in (1, 0):
+                with self.subTest(code=code):
+                    app.upload_queue.put((filepath, app.upload_generation))
+                    app.upload_queue.put(None)
+                    with patch.object(app.subprocess, 'Popen', return_value=Mock(
+                            wait=Mock(return_value=code), poll=Mock(return_value=code))) as spawn, \
+                         self.assertLogs(app.log, level='INFO'):
+                        app.upload_worker()
+                    self.assertEqual(spawn.call_args[0][0],
+                                     ['rclone', 'copyto', str(filepath), f'{app.GDRIVE_DIR}/rec.wav'])
+                    self.assertTrue(filepath.exists())
+                    self.assertEqual(app.upload_last_failed, bool(code))
+                    self.assertEqual(app._upload_status_text(),
+                                     'GDRIVE UPLOAD ERR' if code else 'SAVE: SD -> GDRIVE')
 
-    def test_probe_ssd_write_fails_when_directory_unwritable(self):
-        with patch.object(app, 'SAVE_DIR', Path('/nonexistent-root/voice')):
-            self.assertFalse(app._probe_ssd_write())
-
-    def test_probe_ssd_write_times_out_on_hanging_io(self):
-        blocked = threading.Event()
-
-        class HangingDir:
-            def mkdir(self, **kwargs):
-                blocked.wait(5)
-
-        with patch.object(app, 'SAVE_DIR', HangingDir()):
-            self.assertFalse(app._probe_ssd_write(timeout=0.05))
-        blocked.set()
+    def test_upload_status_text_while_uploading(self):
+        app.upload_queue.put(('rec.wav', app.upload_generation))
+        self.assertEqual(app._upload_status_text(), 'GDRIVE UPLOADING')
+        self.assertEqual(app._oled_lines()[3], 'GDRIVE UPLOADING')
 
     def test_record_toggle_and_unused(self):
         with patch.object(app, 'start_recording') as start, patch.object(app, 'stop_recording') as stop:
@@ -699,8 +668,6 @@ class ControlsTest(unittest.TestCase):
     def test_recording_and_radio_do_not_touch_ir_leds(self):
         with patch.object(app, '_stop_radio_locked'), \
              patch.object(app, '_open_file'), patch.object(app, 'SAVE_DIR'), \
-             patch.object(app, '_refresh_storage_status', return_value={
-                 'mounted': True, 'free_gib': 100.0, 'total_gib': 200.0, 'low': False}), \
              patch.object(app.threading, 'Thread'), \
              patch.object(app.subprocess, 'Popen', return_value=Mock()):
             app.start_recording()
@@ -853,8 +820,6 @@ class ControlsTest(unittest.TestCase):
         app.spotify_current_source = {'number': 1, 'type': 'playlist', 'name': 'A', 'spotify_id': 'id-a'}
         with patch.object(app, '_stop_radio_locked'), \
              patch.object(app, '_open_file'), patch.object(app, 'SAVE_DIR'), \
-             patch.object(app, '_refresh_storage_status', return_value={
-                 'mounted': True, 'free_gib': 100.0, 'total_gib': 200.0, 'low': False}), \
              patch.object(app.threading, 'Thread'), \
              patch.object(app.subprocess, 'Popen', return_value=Mock()):
             app.start_recording()
@@ -954,6 +919,357 @@ class ControlsTest(unittest.TestCase):
         with patch.object(app.requests, 'request', side_effect=app.requests.RequestException('down')):
             with self.assertRaises(app.SpotifyAPIError):
                 app._spotify_request('GET', '/me/player')
+
+
+    # ---- スケジューラー ----
+
+    def add_schedule(self, **fields):
+        data = {'time': '07:00', 'repeat': 'daily', 'action': 'record_stop', 'enabled': True}
+        data.update(fields)
+        ok, message, task = app.create_schedule(data)
+        self.assertTrue(ok, message)
+        return task
+
+    def test_schedule_validation_rejects_bad_input(self):
+        app.ir_codes = {1: {'name': 'JQBT', 'created_at': 'x', 'signal': ['pulse 1']}}
+        bad = [
+            {'time': '7:00', 'repeat': 'daily', 'action': 'record_stop'},
+            {'time': '24:00', 'repeat': 'daily', 'action': 'record_stop'},
+            {'time': '07:00', 'repeat': 'hourly', 'action': 'record_stop'},
+            {'time': '07:00', 'repeat': 'weekly', 'weekdays': [], 'action': 'record_stop'},
+            {'time': '07:00', 'repeat': 'weekly', 'weekdays': [7], 'action': 'record_stop'},
+            {'time': '07:00', 'repeat': 'once', 'date': '2026-13-01', 'action': 'record_stop'},
+            {'time': '07:00', 'repeat': 'once', 'date': '2000-01-01', 'action': 'record_stop'},
+            {'time': '07:00', 'repeat': 'daily', 'action': 'shutdown'},
+            {'time': '07:00', 'repeat': 'daily', 'action': 'radio', 'target': 999},
+            {'time': '07:00', 'repeat': 'daily', 'action': 'radio', 'target': 'x'},
+            {'time': '07:00', 'repeat': 'daily', 'action': 'ir', 'target': 2},
+            {'time': '07:00', 'repeat': 'daily', 'action': 'mp3', 'target': 'other.mp3'},
+            {'time': '07:00', 'repeat': 'daily', 'action': 'record_stop', 'enabled': 'yes'},
+            None,
+        ]
+        for data in bad:
+            with self.subTest(data=data):
+                ok, message, task = app.create_schedule(data)
+                self.assertFalse(ok)
+                self.assertIsNone(task)
+        self.assertEqual(app.schedules, {})
+        self.assertFalse(self.schedules_file.exists())
+
+    def test_schedule_create_normalizes_and_persists(self):
+        app.ir_codes = {1: {'name': 'JQBT', 'created_at': 'x', 'signal': ['pulse 1']}}
+        radio = self.add_schedule(action='radio', target='3', repeat='weekly', weekdays=[4, 0, 4])
+        ir = self.add_schedule(action='ir', target=1, time='06:59')
+        mp3 = self.add_schedule(action='mp3', target=app.MP3_NAME, record='ignored')
+        stop = self.add_schedule(action='playback_stop', target='ignored')
+        self.assertEqual((radio['id'], radio['target'], radio['weekdays']), (1, 3, [0, 4]))
+        self.assertEqual(ir['target'], 1)
+        self.assertEqual(mp3['target'], app.MP3_NAME)
+        self.assertNotIn('record', mp3)
+        self.assertIsNone(stop['target'])
+        saved = json.loads(self.schedules_file.read_text())
+        self.assertEqual(saved['next_id'], 5)
+        self.assertEqual([task['id'] for task in saved['tasks']], [1, 2, 3, 4])
+        loaded, next_id = app._load_schedules()
+        self.assertEqual(next_id, 5)
+        self.assertEqual(loaded[1], app.schedules[1])
+
+    def test_schedule_load_missing_and_broken_file(self):
+        self.assertEqual(app._load_schedules(), ({}, 1))
+        self.schedules_file.write_text('{broken')
+        with self.assertLogs(app.log, level='ERROR'):
+            self.assertEqual(app._load_schedules(), ({}, 1))
+        self.assertEqual(self.schedules_file.with_suffix('.json.broken').read_text(), '{broken')
+
+    def test_schedule_load_drops_finished_once_tasks(self):
+        base = {'weekdays': [], 'action': 'record_stop', 'target': None, 'enabled': False}
+        tasks = [
+            dict(base, id=1, time='07:00', repeat='once', date='2026-09-26',
+                 last_run='2026-09-26T07:00', last_result={'ok': True}),
+            dict(base, id=2, time='07:00', repeat='once', date='2026-09-26',
+                 last_run='2026-09-26T07:00', last_result={'ok': False}),
+            dict(base, id=3, time='07:00', repeat='daily', date=None,
+                 last_run='2026-09-26T07:00', last_result={'ok': True}),
+        ]
+        self.schedules_file.write_text(json.dumps({'next_id': 4, 'tasks': tasks}))
+        loaded, next_id = app._load_schedules()
+        self.assertEqual(sorted(loaded), [2, 3])
+        self.assertEqual(next_id, 4)
+
+    def test_schedule_update_toggle_delete(self):
+        task = self.add_schedule()
+        ok, message, updated = app.update_schedule(task['id'], {
+            'time': '08:30', 'repeat': 'weekly', 'weekdays': [5, 6], 'action': 'record_start'})
+        self.assertTrue(ok, message)
+        self.assertEqual(app.schedules[1]['time'], '08:30')
+        self.assertEqual(app.update_schedule(99, {})[0], False)
+        self.assertTrue(app.set_schedule_enabled(1, False)[0])
+        self.assertFalse(app.schedules[1]['enabled'])
+        self.assertFalse(json.loads(self.schedules_file.read_text())['tasks'][0]['enabled'])
+        self.assertTrue(app.delete_schedule(1)[0])
+        self.assertFalse(app.delete_schedule(1)[0])
+        self.assertEqual(json.loads(self.schedules_file.read_text())['tasks'], [])
+
+    def test_schedule_save_failure_rolls_back(self):
+        with patch.object(app, '_save_schedules', side_effect=OSError('disk full')):
+            ok, message, task = app.create_schedule(
+                {'time': '07:00', 'repeat': 'daily', 'action': 'record_stop'})
+        self.assertFalse(ok)
+        self.assertEqual(app.schedules, {})
+        self.assertEqual(app.schedule_next_id, 1)
+
+    def test_scheduler_first_tick_after_start_does_not_run_past_tasks(self):
+        self.add_schedule(time='07:00')
+        with patch.object(app, 'stop_recording') as stop:
+            self.assertEqual(app.run_due_schedules(app.datetime(2026, 9, 28, 7, 0, 30)), [])
+            stop.assert_not_called()
+            self.assertEqual(app.run_due_schedules(app.datetime(2026, 9, 28, 7, 1, 0, 200000)), [])
+            stop.assert_not_called()
+
+    def test_scheduler_runs_daily_once_per_occurrence(self):
+        self.add_schedule(time='07:00')
+        app.scheduler_last_checked = app.datetime(2026, 9, 28, 6, 59, 0, 200000)
+        with patch.object(app, 'stop_recording', return_value=True) as stop:
+            results = app.run_due_schedules(app.datetime(2026, 9, 28, 7, 0, 0, 200000))
+            self.assertEqual(results, [(1, True, '録音を停止しました')])
+            # 時刻が巻き戻って同じ分をもう一度通過しても再実行しない。
+            app.scheduler_last_checked = app.datetime(2026, 9, 28, 6, 59, 59)
+            self.assertEqual(app.run_due_schedules(app.datetime(2026, 9, 28, 7, 0, 30)), [])
+            stop.assert_called_once_with()
+        saved = json.loads(self.schedules_file.read_text())['tasks'][0]
+        self.assertEqual(saved['last_run'], '2026-09-28T07:00')
+        self.assertTrue(saved['last_result']['ok'])
+        self.assertTrue(saved['enabled'])
+        # 翌日も実行される。
+        app.scheduler_last_checked = app.datetime(2026, 9, 29, 6, 59, 30)
+        with patch.object(app, 'stop_recording', return_value=False):
+            self.assertEqual(app.run_due_schedules(app.datetime(2026, 9, 29, 7, 0, 1)),
+                             [(1, True, '録音していません')])
+
+    def test_scheduler_weekly_and_disabled(self):
+        self.add_schedule(time='07:00', repeat='weekly', weekdays=[0])  # 月曜
+        self.add_schedule(time='07:00', enabled=False)
+        with patch.object(app, 'stop_recording', return_value=True) as stop:
+            app.scheduler_last_checked = app.datetime(2026, 9, 27, 6, 59, 30)  # 日曜
+            self.assertEqual(app.run_due_schedules(app.datetime(2026, 9, 27, 7, 0, 1)), [])
+            app.scheduler_last_checked = app.datetime(2026, 9, 28, 6, 59, 30)  # 月曜
+            self.assertEqual([r[0] for r in app.run_due_schedules(app.datetime(2026, 9, 28, 7, 0, 1))], [1])
+        stop.assert_called_once_with()
+
+    def test_scheduler_once_deleted_only_after_success(self):
+        for ok in (True, False):
+            with self.subTest(ok=ok):
+                app.schedules = {}
+                future = (app.datetime.now() + app.timedelta(days=2)).date().isoformat()
+                task = self.add_schedule(time='07:00', repeat='once', date=future, action='record_start')
+                minute = app.datetime.fromisoformat(f'{future}T07:00')
+                app.scheduler_last_checked = minute - app.timedelta(seconds=30)
+                with patch.object(app, 'start_recording', return_value=(ok, 'msg')):
+                    app.run_due_schedules(minute + app.timedelta(seconds=1))
+                if ok:
+                    self.assertNotIn(task['id'], app.schedules)
+                    self.assertEqual(json.loads(self.schedules_file.read_text())['tasks'], [])
+                else:
+                    self.assertTrue(app.schedules[task['id']]['enabled'])
+                    self.assertFalse(app.schedules[task['id']]['last_result']['ok'])
+
+    def test_scheduler_large_clock_jump_does_not_catch_up(self):
+        self.add_schedule(time='07:00')
+        self.add_schedule(time='10:59')
+        app.scheduler_last_checked = app.datetime(2026, 9, 28, 3, 0)
+        with patch.object(app, 'stop_recording', return_value=True) as stop, \
+             self.assertLogs(app.log, level='WARNING'):
+            results = app.run_due_schedules(app.datetime(2026, 9, 28, 11, 0, 5))
+        self.assertEqual([r[0] for r in results], [2])  # 90秒以内の10:59だけ
+        stop.assert_called_once_with()
+
+    def test_scheduler_same_minute_runs_stop_ir_then_start_in_order(self):
+        app.ir_codes = {1: {'name': 'JQBT', 'created_at': 'x', 'signal': ['pulse 1']},
+                        2: {'name': 'TV', 'created_at': 'x', 'signal': ['pulse 1']}}
+        self.add_schedule(action='radio', target=2)
+        self.add_schedule(action='ir', target=2)
+        self.add_schedule(action='playback_stop')
+        self.add_schedule(action='ir', target=1)
+        self.add_schedule(action='mp3', target=app.MP3_NAME)
+        self.add_schedule(action='record_start')
+        order = []
+        with patch.object(app, 'start_radio', side_effect=lambda s, toggle: order.append(('radio', s['number'], toggle)) or (True, 'ok')), \
+             patch.object(app, 'start_mp3', side_effect=lambda: order.append('mp3') or (True, 'ok')), \
+             patch.object(app, 'send_ir', side_effect=lambda n: order.append(('ir', n)) or (True, 'ok')), \
+             patch.object(app, 'start_recording', side_effect=lambda: order.append('record_start') or (False, '録音中')), \
+             patch.object(app, 'stop_playback', side_effect=lambda: order.append('playback_stop') or True):
+            app.scheduler_last_checked = app.datetime(2026, 9, 28, 6, 59, 59)
+            results = app.run_due_schedules(app.datetime(2026, 9, 28, 7, 0, 0, 200000))
+        self.assertEqual(order, ['playback_stop', ('ir', 2), ('ir', 1), 'record_start',
+                                 ('radio', 2, False), 'mp3'])
+        self.assertEqual(len(results), 6)
+        self.assertFalse(app.schedules[6]['last_result']['ok'])
+
+    def test_scheduler_uses_existing_core_functions_end_to_end(self):
+        """モックはsubprocess層のみ。既存のstart_radio/start_mp3/stop_playbackを通ることを確認する。"""
+        self.add_schedule(time='07:00', action='radio', target=3)
+        self.add_schedule(time='07:01', action='mp3', target=app.MP3_NAME)
+        self.add_schedule(time='07:02', action='playback_stop')
+        process = Mock(pid=321, stdout=None, poll=Mock(return_value=None))
+        with patch.object(app.subprocess, 'Popen', return_value=process) as spawn, \
+             patch.object(app, '_terminate_group') as terminate:
+            app.scheduler_last_checked = app.datetime(2026, 9, 28, 6, 59, 59)
+            app.run_due_schedules(app.datetime(2026, 9, 28, 7, 0, 1))
+            self.assertEqual(app.current_station['number'], 3)
+            self.assertEqual(self.station_file.read_text(), '3\n')
+            app.run_due_schedules(app.datetime(2026, 9, 28, 7, 1, 1))
+            self.assertEqual(app.current_station['kind'], 'mp3')
+            self.assertEqual(self.station_file.read_text(), '3\n')
+            app.run_due_schedules(app.datetime(2026, 9, 28, 7, 2, 1))
+        self.assertIsNone(app.radio_process)
+        self.assertEqual(spawn.call_count, 2)
+        self.assertEqual(terminate.call_count, 2)
+
+    def test_scheduled_radio_blocked_while_recording_is_reported(self):
+        self.add_schedule(action='radio', target=1)
+        app.record_process = Mock(poll=Mock(return_value=None))
+        with patch.object(app.subprocess, 'Popen') as spawn:
+            app.scheduler_last_checked = app.datetime(2026, 9, 28, 6, 59, 59)
+            results = app.run_due_schedules(app.datetime(2026, 9, 28, 7, 0, 1))
+        spawn.assert_not_called()
+        self.assertFalse(results[0][1])
+        self.assertIn('録音中', app.schedules[1]['last_result']['message'])
+
+    def test_scheduler_exception_in_action_is_recorded(self):
+        self.add_schedule(action='record_start')
+        with patch.object(app, 'start_recording', side_effect=RuntimeError('boom')), \
+             self.assertLogs(app.log, level='ERROR'):
+            app.scheduler_last_checked = app.datetime(2026, 9, 28, 6, 59, 59)
+            results = app.run_due_schedules(app.datetime(2026, 9, 28, 7, 0, 1))
+        self.assertEqual(results, [(1, False, 'boom')])
+
+    def test_scheduler_skips_when_shutting_down(self):
+        self.add_schedule()
+        app.scheduler_last_checked = app.datetime(2026, 9, 28, 6, 59, 59)
+        app.shutdown_event.set()
+        with patch.object(app, 'stop_recording') as stop:
+            self.assertEqual(app.run_due_schedules(app.datetime(2026, 9, 28, 7, 0, 1)), [])
+        stop.assert_not_called()
+
+    def test_scheduler_does_not_hold_lock_while_executing(self):
+        self.add_schedule(action='record_start')
+        observed = []
+        def action():
+            thread = threading.Thread(target=lambda: observed.append(app.control_lock.acquire(timeout=1)
+                                                                     and app.control_lock.release() is None))
+            thread.start()
+            thread.join()
+            return True, 'ok'
+        with patch.object(app, 'start_recording', side_effect=action):
+            app.scheduler_last_checked = app.datetime(2026, 9, 28, 6, 59, 59)
+            app.run_due_schedules(app.datetime(2026, 9, 28, 7, 0, 1))
+        self.assertEqual(observed, [True])
+
+    def test_scheduler_worker_waits_until_next_minute(self):
+        waits = []
+        def fake_wait(timeout):
+            waits.append(timeout)
+            app.shutdown_event.set()
+        with patch.object(app, 'run_due_schedules') as run, \
+             patch.object(app.shutdown_event, 'wait', side_effect=fake_wait), \
+             patch.object(app, 'datetime', Mock(now=Mock(return_value=app.datetime(2026, 9, 28, 7, 0, 45)))):
+            app.scheduler_worker()
+        run.assert_called_once_with()
+        self.assertAlmostEqual(waits[0], 15.2)
+
+    def test_stop_playback_uses_existing_stop_functions(self):
+        with patch.object(app, 'stop_radio', return_value=False) as radio, \
+             patch.object(app, 'stop_spotify', return_value=True) as spotify, \
+             patch.object(app, 'stop_recording') as record:
+            self.assertTrue(app.stop_playback())
+        radio.assert_called_once_with()
+        spotify.assert_called_once_with()
+        record.assert_not_called()
+
+    def test_schedule_web_api_crud(self):
+        client = app.app.test_client()
+        response = client.post('/api/schedules', json={
+            'time': '07:15', 'repeat': 'daily', 'action': 'radio', 'target': '2', 'enabled': True})
+        self.assertEqual(response.status_code, 200, response.json)
+        self.assertEqual(client.post('/api/schedules', json={'time': 'x'}).status_code, 400)
+        data = client.get('/api/schedules').json
+        self.assertEqual(len(data['tasks']), 1)
+        self.assertEqual(data['tasks'][0]['target_label'], app.stations[1]['name'])
+        self.assertEqual(data['tasks'][0]['action_label'], 'ラジオ再生')
+        self.assertEqual(data['options']['mp3'], [{'value': app.MP3_NAME, 'name': app.MP3_NAME}])
+        self.assertTrue(data['options']['stations'])
+        response = client.post('/api/schedules/1', json={
+            'time': '07:20', 'repeat': 'weekly', 'weekdays': [1], 'action': 'playback_stop'})
+        self.assertEqual(response.status_code, 200, response.json)
+        self.assertEqual(client.post('/api/schedules/1/enabled', json={'enabled': False}).status_code, 200)
+        self.assertFalse(app.schedules[1]['enabled'])
+        self.assertEqual(client.post('/api/schedules/1/enabled', json={'enabled': 'no'}).status_code, 400)
+        self.assertEqual(client.post('/api/schedules/abc/delete').status_code, 400)
+        self.assertEqual(client.post('/api/schedules/1/delete').status_code, 200)
+        self.assertEqual(client.post('/api/schedules/1/delete').status_code, 400)
+        self.assertEqual(client.get('/api/schedules').json['tasks'], [])
+
+    def test_index_renders_schedule_tab(self):
+        html = app.app.test_client().get('/').get_data(as_text=True)
+        self.assertIn('data-tab="schedule"', html)
+        self.assertIn('id="scheduleForm"', html)
+        self.assertIn('type="datetime-local"', html)
+        self.assertIn('<option value="spotify">', html)
+        self.assertIn('${name}', html)
+
+    def write_spotify_sources(self):
+        self.spotify_sources_file.write_text(json.dumps([
+            {'type': 'playlist', 'name': 'A', 'spotify_id': 'id-a'},
+            {'type': 'artist', 'name': 'B', 'spotify_id': 'id-b'},
+        ]))
+
+    def test_schedule_spotify_validation_and_options(self):
+        self.write_spotify_sources()
+        for target in (None, '', 'id-missing', 2):
+            with self.subTest(target=target):
+                self.assertFalse(app.create_schedule({'time': '07:00', 'repeat': 'daily',
+                                                      'action': 'spotify', 'target': target})[0])
+        task = self.add_schedule(action='spotify', target='id-b')
+        self.assertEqual(task['target'], 'id-b')
+        data = app.list_schedules()
+        self.assertEqual(data['options']['spotify'], [{'value': 'id-a', 'name': '1. A'},
+                                                      {'value': 'id-b', 'name': '2. B'}])
+        self.assertEqual(data['tasks'][0]['target_label'], 'B')
+        self.assertEqual(data['tasks'][0]['action_label'], 'Spotify再生')
+
+    def test_scheduler_spotify_uses_start_spotify_and_follows_reordering(self):
+        self.write_spotify_sources()
+        self.add_schedule(action='spotify', target='id-b')
+        # 登録後に並び順が変わっても、spotify_idで同じ再生リストを選ぶ。
+        self.spotify_sources_file.write_text(json.dumps([
+            {'type': 'artist', 'name': 'B', 'spotify_id': 'id-b'},
+            {'type': 'playlist', 'name': 'A', 'spotify_id': 'id-a'},
+        ]))
+        with patch.object(app, 'start_spotify', return_value=(True, 'ok')) as start:
+            app.scheduler_last_checked = app.datetime(2026, 9, 28, 6, 59, 59)
+            app.run_due_schedules(app.datetime(2026, 9, 28, 7, 0, 1))
+        self.assertEqual(start.call_args.args[0]['spotify_id'], 'id-b')
+        self.assertEqual(start.call_args.args[0]['number'], 1)
+        # 削除されていれば失敗として記録する。
+        self.spotify_sources_file.write_text('[]')
+        with patch.object(app, 'start_spotify') as start:
+            app.scheduler_last_checked = app.datetime(2026, 9, 29, 6, 59, 59)
+            results = app.run_due_schedules(app.datetime(2026, 9, 29, 7, 0, 1))
+        start.assert_not_called()
+        self.assertFalse(results[0][1])
+
+    def test_scheduled_spotify_through_existing_start_spotify(self):
+        self.write_spotify_sources()
+        self.add_schedule(action='spotify', target='id-a')
+        app.radio_process = Mock(pid=5, stdout=None, poll=Mock(return_value=None))
+        app.current_station = app.stations[0]
+        with patch.object(app, '_terminate_group'), \
+             patch.object(app.threading, 'Thread') as thread:
+            app.scheduler_last_checked = app.datetime(2026, 9, 28, 6, 59, 59)
+            results = app.run_due_schedules(app.datetime(2026, 9, 28, 7, 0, 1))
+        self.assertEqual(results, [(1, True, 'Spotify再生を開始しました')])
+        self.assertIsNone(app.radio_process)  # 既存仕様どおりラジオを止める
+        self.assertEqual(thread.call_args.kwargs['target'], app._spotify_play_worker)
 
 
 if __name__ == '__main__':
