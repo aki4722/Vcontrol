@@ -52,8 +52,7 @@ CPU_TEMP_FILE = Path("/sys/class/thermal/thermal_zone0/temp")
 CPU_TEMP_UPDATE_SECONDS = 30
 STORAGE_UPDATE_SECONDS = 30
 REC_BLINK_SECONDS = 0.5
-IR_RX_LED_GPIO = 22
-IR_TX_LED_GPIO = 10
+IR_LED_GPIO = 22  # IR受信（学習）・送信の共用ステータスLED
 IR_RX_DEVICE = "/dev/lirc1"
 IR_TX_DEVICE = "/dev/lirc0"
 IR_CODES_FILE = BASE_DIR / "ir_codes.json"
@@ -120,8 +119,7 @@ ir_pgid = None
 ir_learn_generation = 0
 ir_learn_timer = None
 ir_error = None
-ir_rx_led = None
-ir_tx_led = None
+ir_led = None
 spotify_sources = []
 spotify_current_source = None
 spotify_now_playing = None
@@ -784,7 +782,8 @@ def stop_playback():
 # ---- IR remote（学習・送信）----
 # GPIO4/GPIO18はdtoverlay=gpio-ir/gpio-ir-txがカーネルドライバとして専有するため、
 # アプリコードから直接触らず、必ず /dev/lirc1（受信）・/dev/lirc0（送信）を
-# ir-ctl経由で使う。GPIO22・GPIO10はステータスLED（gpiozero）専用。
+# ir-ctl経由で使う。GPIO22はIR受信・送信共用のステータスLED（gpiozero）専用。
+# 受信と送信はir_stateで排他なので1個のLEDで兼用できる。
 
 
 def start_ir_learning():
@@ -808,7 +807,7 @@ def start_ir_learning():
         ir_pgid = process.pid
         ir_error = None
         ir_state = IR_STATE_RECEIVING
-        ir_rx_led.on()
+        ir_led.on()
         generation = ir_learn_generation
         threading.Thread(target=_ir_learn_worker, args=(process, generation), daemon=True).start()
         ir_learn_timer = threading.Timer(IR_LEARN_TIMEOUT_SECONDS, cancel_ir_learning)
@@ -829,7 +828,7 @@ def cancel_ir_learning():
         ir_pgid = None
         ir_learn_generation += 1
         ir_state = IR_STATE_IDLE
-        ir_rx_led.off()
+        ir_led.off()
         if ir_learn_timer is not None:
             ir_learn_timer.cancel()
             ir_learn_timer = None
@@ -877,7 +876,7 @@ def _ir_learn_worker(process, generation):
                 ir_error = f"IRデータを保存できません: {exc}"
                 log.exception("IRデータ保存失敗")
         ir_state = IR_STATE_IDLE
-        ir_rx_led.off()
+        ir_led.off()
 
 
 def rename_ir_code(number, name):
@@ -910,7 +909,7 @@ def send_ir(number):
             return False, "指定したIR番号が見つかりません"
         signal_lines = ir_codes[number]["signal"]
         ir_state = IR_STATE_TRANSMITTING
-        ir_tx_led.on()
+        ir_led.on()
     log.info("IR送信開始: IR No.%s", number)
     temp_path = None
     try:
@@ -945,7 +944,7 @@ def send_ir(number):
                 pass
         with control_lock:
             ir_state = IR_STATE_IDLE
-            ir_tx_led.off()
+            ir_led.off()
 
 
 def send_ir_sequence(numbers, gap_seconds=0.3):
@@ -2172,10 +2171,10 @@ def cleanup():
             process = upload_process
             if process is not None:
                 _terminate_group(process, process.pid)
-        for led in (record_led, ir_rx_led, ir_tx_led):
+        for led in (record_led, ir_led):
             if led is not None:
                 led.off()
-        for led in (record_led, ir_rx_led, ir_tx_led):
+        for led in (record_led, ir_led):
             if led is not None:
                 led.close()
         if oled_device is not None:
@@ -2214,7 +2213,7 @@ def configure_bluetooth_audio():
 
 
 def main():
-    global record_led, ir_rx_led, ir_tx_led, upload_thread, oled_device, oled_thread, spotify_poll_thread
+    global record_led, ir_led, upload_thread, oled_device, oled_thread, spotify_poll_thread
     global scheduler_thread
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     def request_shutdown(signum, frame):
@@ -2235,10 +2234,8 @@ def main():
             log.exception("録音保存先ディレクトリを作成できません: %s", SAVE_DIR)
         record_led = LED(RECORD_LED_GPIO)
         record_led.off()
-        ir_rx_led = LED(IR_RX_LED_GPIO)
-        ir_tx_led = LED(IR_TX_LED_GPIO)
-        ir_rx_led.off()
-        ir_tx_led.off()
+        ir_led = LED(IR_LED_GPIO)
+        ir_led.off()
         scanner = threading.Thread(target=keyboard_worker, daemon=True)
         scanner.start()
         upload_thread = threading.Thread(target=upload_worker, daemon=True)

@@ -57,8 +57,7 @@ class ControlsTest(unittest.TestCase):
         app.ir_error = None
         app.ir_codes = {}
         app.ir_next_number = 1
-        app.ir_rx_led = Mock()
-        app.ir_tx_led = Mock()
+        app.ir_led = Mock()
         app.spotify_sources = []
         app.spotify_current_source = None
         app.spotify_now_playing = None
@@ -453,7 +452,7 @@ class ControlsTest(unittest.TestCase):
             ok, message = app.start_ir_learning()
         self.assertTrue(ok)
         self.assertEqual(app.ir_state, app.IR_STATE_RECEIVING)
-        app.ir_rx_led.on.assert_called_once()
+        app.ir_led.on.assert_called_once()
         spawn.assert_called_once_with(
             ['ir-ctl', '-d', app.IR_RX_DEVICE, '--receive', '--mode2', '--one-shot'],
             stdout=app.subprocess.PIPE, stderr=app.subprocess.PIPE, start_new_session=True)
@@ -484,7 +483,7 @@ class ControlsTest(unittest.TestCase):
         terminate.assert_called_once_with(process, 555)
         self.assertEqual(app.ir_state, app.IR_STATE_IDLE)
         self.assertEqual(app.ir_learn_generation, 4)
-        app.ir_rx_led.off.assert_called_once()
+        app.ir_led.off.assert_called_once()
         timer.cancel.assert_called_once()
         self.assertIsNone(app.ir_learn_timer)
 
@@ -493,7 +492,7 @@ class ControlsTest(unittest.TestCase):
             result = app.cancel_ir_learning()
         self.assertFalse(result)
         terminate.assert_not_called()
-        app.ir_rx_led.off.assert_not_called()
+        app.ir_led.off.assert_not_called()
 
     def test_ir_learn_worker_success(self):
         process = Mock(pid=555, returncode=0)
@@ -504,7 +503,7 @@ class ControlsTest(unittest.TestCase):
         self.assertEqual(app.ir_next_number, 2)
         self.assertEqual(app.ir_codes[1]['name'], 'リモコン1')
         self.assertEqual(app.ir_codes[1]['signal'], ['pulse 9024', 'space 4512', 'pulse 620'])
-        app.ir_rx_led.off.assert_called_once()
+        app.ir_led.off.assert_called_once()
         saved = json.loads(self.ir_codes_file.read_text())
         self.assertEqual(saved['codes']['1']['name'], 'リモコン1')
         self.assertEqual(saved['next_number'], 2)
@@ -517,7 +516,7 @@ class ControlsTest(unittest.TestCase):
         self.assertEqual(app.ir_state, app.IR_STATE_IDLE)
         self.assertEqual(app.ir_codes, {})
         self.assertIsNotNone(app.ir_error)
-        app.ir_rx_led.off.assert_called_once()
+        app.ir_led.off.assert_called_once()
         self.assertFalse(self.ir_codes_file.exists())
 
     def test_ir_learn_worker_discards_stale_generation(self):
@@ -526,7 +525,7 @@ class ControlsTest(unittest.TestCase):
         app.ir_learn_generation = 5
         app._ir_learn_worker(process, 4)
         self.assertEqual(app.ir_codes, {})
-        app.ir_rx_led.off.assert_not_called()
+        app.ir_led.off.assert_not_called()
 
     def test_rename_ir_code(self):
         app.ir_codes = {1: {'name': 'リモコン1', 'created_at': 'x', 'signal': ['pulse 1', 'space 1']}}
@@ -559,8 +558,8 @@ class ControlsTest(unittest.TestCase):
         temp_path = args[3].split('=', 1)[1]
         self.assertFalse(Path(temp_path).exists())
         self.assertEqual(app.ir_state, app.IR_STATE_IDLE)
-        app.ir_tx_led.on.assert_called_once()
-        app.ir_tx_led.off.assert_called_once()
+        app.ir_led.on.assert_called_once()
+        app.ir_led.off.assert_called_once()
 
     def test_send_ir_missing_number(self):
         with patch.object(app.subprocess, 'Popen') as spawn:
@@ -575,7 +574,7 @@ class ControlsTest(unittest.TestCase):
             ok, message = app.send_ir(1)
         self.assertFalse(ok)
         spawn.assert_not_called()
-        app.ir_tx_led.on.assert_not_called()
+        app.ir_led.on.assert_not_called()
 
     def test_ir_learn_start_blocked_while_transmitting(self):
         app.ir_state = app.IR_STATE_TRANSMITTING
@@ -593,8 +592,8 @@ class ControlsTest(unittest.TestCase):
             ok, message = app.send_ir(1)
         self.assertFalse(ok)
         self.assertEqual(app.ir_state, app.IR_STATE_IDLE)
-        app.ir_tx_led.on.assert_called_once()
-        app.ir_tx_led.off.assert_called_once()
+        app.ir_led.on.assert_called_once()
+        app.ir_led.off.assert_called_once()
 
     def test_ir_codes_persist_and_reload(self):
         app.ir_codes = {1: {'name': 'リモコン1', 'created_at': 'x', 'signal': ['pulse 1', 'space 1']}}
@@ -671,8 +670,7 @@ class ControlsTest(unittest.TestCase):
              patch.object(app.threading, 'Thread'), \
              patch.object(app.subprocess, 'Popen', return_value=Mock()):
             app.start_recording()
-        app.ir_rx_led.on.assert_not_called()
-        app.ir_tx_led.on.assert_not_called()
+        app.ir_led.on.assert_not_called()
 
     # ---- Spotify ----
 

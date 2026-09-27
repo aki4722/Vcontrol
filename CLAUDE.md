@@ -147,13 +147,15 @@ same atomic `.tmp`-then-`Path.replace()` write pattern as `save_station_number`.
 
 - Target device is a Raspberry Pi running Raspberry Pi OS (`platform` reports
   `7.0.0-1019-raspi`).
-- GPIO27 → LED (via `gpiozero.LED`) lights while recording; blinks at 0.5s via the OLED
-  loop's `REC_BLINK_SECONDS`. No other GPIO/button matrix is used.
+- GPIO27 → LED (via `gpiozero.LED`) stays lit (steady) while recording; the 0.5s
+  `REC_BLINK_SECONDS` blink applies only to the OLED's REC indicator, not the LED. No other GPIO/button matrix is used.
 - IR add-on board: GPIO4 = IR receive, GPIO18 = IR transmit (transistor-driven) — both
   claimed by kernel dtoverlays (`gpio-ir`/`gpio-ir-tx`, already active), so application
   code accesses them only via `/dev/lirc1`/`/dev/lirc0` through the `ir-ctl` subprocess,
-  never via `gpiozero`/raw GPIO. GPIO22 → IR-receiving LED, GPIO10 → IR-sending LED (same
-  `gpiozero.LED` pattern as GPIO27, distinct purpose — don't conflate them). `/dev/lirc*`
+  never via `gpiozero`/raw GPIO. GPIO22 → single IR status LED (`ir_led`), lit while
+  receiving *or* transmitting — the two are mutually exclusive via `ir_state`, so one LED
+  suffices (same `gpiozero.LED` pattern as GPIO27, distinct purpose — don't conflate them).
+  GPIO10 (LED still wired) is reserved for a future, different status LED. `/dev/lirc*`
   are `root:video` (fixed OS udev rule), so both the systemd service
   (`SupplementaryGroups=`) and any manual-run user need the `video` group.
 - **Known EMI issue**: keep the external USB Bluetooth dongle (TP-Link UB500,
