@@ -1,0 +1,10 @@
+{
+  "devices": [
+    {
+      "id": "iphone",
+      "name": "iPhone",
+      "bluetooth_address": "8C:33:96:18:F4:AD",
+      "wifi_mac": "8c:33:96:1e:bf:1a"
+    }
+  ]
+}

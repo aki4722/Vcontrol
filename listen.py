@@ -3,6 +3,7 @@
 
 import atexit
 import configparser
+import ipaddress
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ import queue
 import re
 import signal
 import select
+import socket
 import shutil
 import subprocess
 import tempfile
@@ -81,8 +83,37 @@ SCHEDULE_ACTION_LABELS = {
     "record_start": "録音開始", "record_stop": "録音停止", "playback_stop": "再生停止",
 }
 SCHEDULE_REPEATS = ("daily", "weekly", "once")
+# iPhone在宅条件。既存データにない場合は "any"（関係なし）として扱う。
+SCHEDULE_PRESENCE_CONDITIONS = ("any", "present", "absent")
+SCHEDULE_PRESENCE_LABELS = {
+    "any": "関係なし", "present": "iPhoneが在宅の時だけ実行", "absent": "iPhoneが不在の時だけ実行",
+}
 SCHEDULE_CATCHUP_SECONDS = 90
 SCHEDULE_IR_GAP_SECONDS = 0.3
+# ---- 登録端末の在宅判定 ----
+PRESENCE_LED_GPIO = 10
+PRESENCE_DEVICES_FILE = BASE_DIR / "presence_devices.json"
+# 最後に確認できてからこの秒数、Wi-Fi/Bluetoothのどちらでも確認できなければ不在にする。
+PRESENCE_ABSENT_TIMEOUT_SECONDS = int(os.environ.get("PRESENCE_ABSENT_TIMEOUT_SECONDS", "300"))
+PRESENCE_CHECK_INTERVAL_SECONDS = int(os.environ.get("PRESENCE_CHECK_INTERVAL_SECONDS", "30"))
+# 空UDPを送ってからARP応答（ip neighのconfirmed更新）を待つ秒数。
+# STALEなエントリはカーネルがDELAY(5秒)→PROBEと進むため、5秒より長く待つ。
+PRESENCE_ARP_WAIT_SECONDS = 7
+# REACHABLEなエントリはカーネルが再確認しない（base_reachable_time 15〜45秒）ため、
+# 走査開始からこの秒数以内にARP応答で確認済みなら「見えた」とみなす。
+PRESENCE_ARP_RECENT_SECONDS = 60
+# mDNSポート。iPhoneは常に開けているためICMP port unreachableを返さない。
+# （閉じたポートだとiPhoneが返信のために自らARP要求を送り、Piのエントリが
+#   確認なしのSTALEに上書きされてconfirmedが更新されない）
+PRESENCE_PROBE_PORT = 5353
+PRESENCE_PROBE_PAYLOAD = bytes(12)  # 質問数0の空mDNSヘッダ（応答は発生しない）
+PRESENCE_COMMAND_TIMEOUT_SECONDS = 3
+PRESENCE_BT_TIMEOUT_SECONDS = 10
+PRESENCE_MAX_SCAN_HOSTS = 1024
+PRESENCE_PRESENT = "present"
+PRESENCE_ABSENT = "absent"
+PRESENCE_UNKNOWN = "unknown"
+PRESENCE_LABELS = {PRESENCE_PRESENT: "在宅", PRESENCE_ABSENT: "不在", PRESENCE_UNKNOWN: "判定不能"}
 
 log = logging.getLogger(__name__)
 app = Flask(__name__)
@@ -131,6 +162,9 @@ spotify_device_id = None
 spotify_configured_warned = False
 scheduler_thread = None
 scheduler_last_checked = None
+presence_led = None
+presence_thread = None
+presence_started_at = time.monotonic()
 
 
 def load_stations():
@@ -257,8 +291,11 @@ def _normalize_schedule(data, check_targets=True):
     enabled = data.get("enabled", True)
     if type(enabled) is not bool:
         raise ValueError("有効/無効の指定が不正です")
+    presence = data.get("presence") or "any"
+    if presence not in SCHEDULE_PRESENCE_CONDITIONS:
+        raise ValueError("iPhone条件の指定が不正です")
     return {"time": time_text, "repeat": repeat, "weekdays": weekdays, "date": run_date,
-            "action": action, "target": target, "enabled": enabled}
+            "action": action, "target": target, "enabled": enabled, "presence": presence}
 
 
 def _schedule_once_finished(task):
@@ -1199,6 +1236,215 @@ def spotify_poll_worker():
 # スケジュールの状態もcontrol_lockで保護し、実行（IR送信等のブロッキング処理）はロック外で行う。
 
 
+# ---- 登録端末の在宅判定 ----
+# 端末管理・在宅判定はこの節で完結させ、外部（スケジュール・Web・LED）には
+# presence_state() / presence_snapshot() だけを公開する。将来の端末連携機能
+# （通知・ファイル送受信・複数端末管理など）もこの登録端末リストを土台にする。
+# - Wi-Fi: LAN内の全アドレスのmDNSポートへ空のUDPを送ってARP解決を起こし、ip neighの
+#   confirmed（最後にARP応答があってからの秒数）でMACアドレスを探す。スリープ中の
+#   iPhoneはpingに応答しないことがあるが、ARPには応答しやすい。IPが変わっても影響しない。
+# - Bluetooth: hcitool name（root不要、ペアリング不要）。Wi-Fiで見つからない時だけ行い、
+#   再生中（JQ-BTへ送信中）は音途切れを避けるため行わない。
+# 1回見つからないだけでは不在にせず、PRESENCE_ABSENT_TIMEOUT_SECONDS以上
+# 確認できない時にABSENT、確認手段自体が失敗し続けた時にUNKNOWNにする。
+
+_MAC_PATTERN = re.compile(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}")
+
+
+def _normalize_mac(value, label):
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str) or not _MAC_PATTERN.fullmatch(value.strip().lower()):
+        raise ValueError(f"{label}の形式が不正です: {value}")
+    return value.strip().lower()
+
+
+def _load_presence_devices():
+    """presence_devices.jsonを読み込む。無い/壊れている場合は端末なし（常にUNKNOWN）で継続する。"""
+    if not PRESENCE_DEVICES_FILE.exists():
+        log.info("[在宅判定] %s がないため在宅判定は行いません", PRESENCE_DEVICES_FILE.name)
+        return []
+    try:
+        data = json.loads(PRESENCE_DEVICES_FILE.read_text(encoding="utf-8"))
+        devices = []
+        for item in data.get("devices", []):
+            device_id = str(item["id"])
+            if any(device["id"] == device_id for device in devices):
+                raise ValueError(f"idが重複しています: {device_id}")
+            device = {
+                "id": device_id,
+                "name": str(item.get("name") or device_id),
+                "bluetooth_address": _normalize_mac(item.get("bluetooth_address"), "bluetooth_address"),
+                "wifi_mac": _normalize_mac(item.get("wifi_mac"), "wifi_mac"),
+                "state": PRESENCE_UNKNOWN,
+                "last_seen": None,
+                "last_seen_via": None,
+                "seen_at": None,     # time.monotonic()。タイムアウト判定用（時刻補正の影響を受けない）
+                "checked_at": None,  # 確認手段が正常に動いた最後の時刻（time.monotonic()）
+            }
+            if not device["bluetooth_address"] and not device["wifi_mac"]:
+                raise ValueError(f"{device_id}: bluetooth_addressかwifi_macのどちらかが必要です")
+            devices.append(device)
+        return devices
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        log.error("[在宅判定] %s を読み込めません（在宅判定は行いません）: %s",
+                  PRESENCE_DEVICES_FILE.name, exc)
+        return []
+
+
+presence_devices = _load_presence_devices()
+
+
+def _presence_scan_wifi():
+    """ARP応答を確認できたMACアドレスの集合を返す。ネットワーク自体を確認できない場合はNone。"""
+    try:
+        result = subprocess.run(["ip", "-j", "-4", "addr", "show", "scope", "global"],
+                                capture_output=True, text=True, check=True,
+                                timeout=PRESENCE_COMMAND_TIMEOUT_SECONDS)
+        networks = []
+        for interface in json.loads(result.stdout or "[]"):
+            for info in interface.get("addr_info", []):
+                if info.get("family") == "inet":
+                    networks.append(ipaddress.ip_interface(f"{info['local']}/{info['prefixlen']}"))
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        log.warning("[在宅判定] ネットワーク情報を取得できません: %s", exc)
+        return None
+    if not networks:
+        return None
+    started = time.monotonic()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        for own in networks:
+            if own.network.num_addresses > PRESENCE_MAX_SCAN_HOSTS + 2:
+                continue  # 大きすぎるネットワークは走査せず、既存のARP表だけを見る
+            for host in own.network.hosts():
+                if host == own.ip:
+                    continue
+                try:
+                    sock.sendto(PRESENCE_PROBE_PAYLOAD, (str(host), PRESENCE_PROBE_PORT))
+                except OSError:
+                    pass
+    if shutdown_event.wait(PRESENCE_ARP_WAIT_SECONDS):
+        return None
+    try:
+        result = subprocess.run(["ip", "-j", "-s", "-4", "neigh", "show"],
+                                capture_output=True, text=True, check=True,
+                                timeout=PRESENCE_COMMAND_TIMEOUT_SECONDS)
+        entries = json.loads(result.stdout or "[]")
+    except (OSError, ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        log.warning("[在宅判定] ARP表を取得できません: %s", exc)
+        return None
+    fresh_seconds = time.monotonic() - started + PRESENCE_ARP_RECENT_SECONDS
+    return {entry["lladdr"].lower() for entry in entries
+            if entry.get("lladdr") and isinstance(entry.get("confirmed"), int)
+            and entry["confirmed"] <= fresh_seconds}
+
+
+def _presence_check_bluetooth(address):
+    """見つかればTrue、応答がなければFalse、Bluetoothが使えない場合はNone。"""
+    try:
+        result = subprocess.run(["hcitool", "name", address], capture_output=True, text=True,
+                                timeout=PRESENCE_BT_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("[在宅判定] Bluetooth確認に失敗しました: %s", exc)
+        return None
+    if result.returncode != 0:
+        log.warning("[在宅判定] Bluetooth確認に失敗しました: %s",
+                    (result.stderr or result.stdout).strip() or result.returncode)
+        return None
+    return bool(result.stdout.strip())
+
+
+def _apply_presence_result(device, seen_via, checked, now):
+    """1回分の確認結果で状態を更新する。control_lock内で呼ぶ。nowはtime.monotonic()。"""
+    previous = device["state"]
+    if seen_via:
+        device.update(state=PRESENCE_PRESENT, seen_at=now, checked_at=now, last_seen_via=seen_via,
+                      last_seen=datetime.now().isoformat(timespec="seconds"))
+    elif checked:
+        device["checked_at"] = now
+        since = device["seen_at"] if device["seen_at"] is not None else presence_started_at
+        if now - since >= PRESENCE_ABSENT_TIMEOUT_SECONDS:
+            device["state"] = PRESENCE_ABSENT
+    else:
+        since = device["checked_at"] if device["checked_at"] is not None else presence_started_at
+        if now - since >= PRESENCE_ABSENT_TIMEOUT_SECONDS:
+            device["state"] = PRESENCE_UNKNOWN
+    if device["state"] != previous:
+        log.info("[在宅判定] %s: %s → %s", device["name"],
+                 PRESENCE_LABELS[previous], PRESENCE_LABELS[device["state"]])
+
+
+def _update_presence_led():
+    """GPIO10: 在宅ならON、不在・判定不能ならOFF。control_lock内で呼ぶ。"""
+    if presence_led is None:
+        return
+    if presence_state() == PRESENCE_PRESENT:
+        presence_led.on()
+    else:
+        presence_led.off()
+
+
+def check_presence():
+    """全登録端末を1回確認する。外部コマンドはロックの外で実行する。"""
+    with control_lock:
+        targets = [(device["id"], device["wifi_mac"], device["bluetooth_address"])
+                   for device in presence_devices]
+        playing = radio_process is not None or spotify_current_source is not None
+    if not targets:
+        return
+    wifi_seen = _presence_scan_wifi() if any(wifi for _, wifi, _ in targets) else None
+    results = {}
+    for device_id, wifi_mac, bluetooth_address in targets:
+        if shutdown_event.is_set():
+            return
+        seen_via = None
+        checked = False
+        if wifi_mac and wifi_seen is not None:
+            checked = True
+            if wifi_mac in wifi_seen:
+                seen_via = "Wi-Fi"
+        if seen_via is None and bluetooth_address and not playing:
+            found = _presence_check_bluetooth(bluetooth_address)
+            if found is not None:
+                checked = True
+                if found:
+                    seen_via = "Bluetooth"
+        results[device_id] = (seen_via, checked)
+    now = time.monotonic()
+    with control_lock:
+        for device in presence_devices:
+            if device["id"] in results:
+                _apply_presence_result(device, *results[device["id"]], now)
+        _update_presence_led()
+
+
+def presence_worker():
+    global presence_started_at
+    presence_started_at = time.monotonic()
+    while not shutdown_event.is_set():
+        try:
+            check_presence()
+        except Exception:
+            log.exception("[在宅判定] 確認中にエラーが発生しました（継続します）")
+        shutdown_event.wait(PRESENCE_CHECK_INTERVAL_SECONDS)
+
+
+def presence_state(device_id=None):
+    """登録端末の在宅状態。device_id省略時は最初に登録した端末（現在はiPhone1台）。"""
+    with control_lock:
+        for device in presence_devices:
+            if device_id is None or device["id"] == device_id:
+                return device["state"]
+        return PRESENCE_UNKNOWN
+
+
+def presence_snapshot():
+    with control_lock:
+        return [{"id": device["id"], "name": device["name"], "state": device["state"],
+                 "state_label": PRESENCE_LABELS[device["state"]], "last_seen": device["last_seen"],
+                 "last_seen_via": device["last_seen_via"]} for device in presence_devices]
+
+
 def _schedule_stations():
     """キーボードと同様にstations.confを読み直す。壊れている場合は起動時の一覧を使う。"""
     try:
@@ -1278,6 +1524,13 @@ def _execute_schedule_action(task):
     return False, f"不明な機能です: {action}"
 
 
+def _schedule_presence_allows(condition, state):
+    """any: 常に実行。present/absent: 状態が一致した時だけ（UNKNOWNは安全側でどちらも実行しない）。"""
+    if condition == "any":
+        return True
+    return state == condition
+
+
 def run_due_schedules(now=None):
     """前回確認時刻からnowまでに予定時刻を迎えたタスクを実行する。
     - 起動直後の初回呼び出しは基準時刻を記録するだけ（再起動前の予定は実行しない）。
@@ -1318,17 +1571,26 @@ def run_due_schedules(now=None):
         if task["action"] == "ir" and previous_action == "ir":
             shutdown_event.wait(SCHEDULE_IR_GAP_SECONDS)
         previous_action = task["action"]
-        log.info("[Scheduler] 実行: No.%s %s %s %s", task["id"], task["time"],
-                 SCHEDULE_ACTION_LABELS[task["action"]], task["target"] or "")
-        try:
-            ok, message = _execute_schedule_action(task)
-        except Exception as exc:
-            log.exception("[Scheduler] 実行中にエラーが発生しました: No.%s", task["id"])
-            ok, message = False, str(exc)
-        if ok:
-            log.info("[Scheduler] 完了: No.%s %s", task["id"], message)
+        condition = task.get("presence", "any")
+        state = presence_state()
+        skipped = not _schedule_presence_allows(condition, state)
+        if skipped:
+            # 条件不一致はエラーではない（1回のみのタスクは実行済みと同様に削除する）。
+            ok, message = True, (f"iPhone在宅条件不一致のためスキップ（条件: {SCHEDULE_PRESENCE_LABELS[condition]}"
+                                 f" / 現在: {PRESENCE_LABELS[state]}）")
+            log.info("[Scheduler] No.%s %s %s", task["id"], SCHEDULE_ACTION_LABELS[task["action"]], message)
         else:
-            log.error("[Scheduler] 失敗: No.%s %s", task["id"], message)
+            log.info("[Scheduler] 実行: No.%s %s %s %s", task["id"], task["time"],
+                     SCHEDULE_ACTION_LABELS[task["action"]], task["target"] or "")
+            try:
+                ok, message = _execute_schedule_action(task)
+            except Exception as exc:
+                log.exception("[Scheduler] 実行中にエラーが発生しました: No.%s", task["id"])
+                ok, message = False, str(exc)
+            if ok:
+                log.info("[Scheduler] 完了: No.%s %s", task["id"], message)
+            else:
+                log.error("[Scheduler] 失敗: No.%s %s", task["id"], message)
         results.append((task["id"], ok, message))
         with control_lock:
             current = schedules.get(task["id"])
@@ -1336,6 +1598,8 @@ def run_due_schedules(now=None):
                 continue  # 実行中に削除された
             current["last_result"] = {"ok": ok, "message": message,
                                       "at": datetime.now().isoformat(timespec="seconds")}
+            if skipped:
+                current["last_result"]["skipped"] = True
             # 実行中に日時を編集された場合は、編集後の予定を削除しない。
             if ok and current["repeat"] == "once" and _schedule_matches(current, minute):
                 del schedules[task["id"]]
@@ -1367,6 +1631,7 @@ def list_schedules():
             task = dict(schedules[number])
             task["action_label"] = SCHEDULE_ACTION_LABELS[task["action"]]
             task["target_label"] = _schedule_target_label(task, station_list)
+            task["presence_label"] = SCHEDULE_PRESENCE_LABELS[task["presence"]]
             tasks.append(task)
         options = {
             "stations": [{"value": item["number"], "name": item["name"]} for item in station_list],
@@ -1506,6 +1771,7 @@ def get_status():
             "spotify_source": spotify_current_source,
             "spotify_now_playing": spotify_now_playing,
             "spotify_sources": spotify_sources,
+            "presence_devices": presence_snapshot(),
         }
 
 
@@ -1583,6 +1849,8 @@ letter-spacing:.1em;max-width:650px;margin:0 auto}
 <div class="status-row"><span class="led" id="ledRadio"></span><span id="radioStatus"></span></div>
 <div class="status-row"><span class="led" id="ledIr"></span><span id="irStatus"></span></div>
 <div class="status-row"><span class="led" id="ledSpotify"></span><span id="spotifyStatus"></span></div>
+<div class="status-row"><span class="led" id="ledPresence"></span><span id="presenceStatus"></span></div>
+<small id="presenceDetail"></small>
 </section>
 <nav class="tabs">
 <button class="tab-btn" data-tab="record" onclick="showTab('record')">録音</button>
@@ -1647,6 +1915,10 @@ letter-spacing:.1em;max-width:650px;margin:0 auto}
 <option value="record_start">録音開始</option><option value="record_stop">録音停止</option><option value="playback_stop">再生停止（ラジオ・MP3・Spotify）</option>
 </select>
 <div id="scheduleTargetBox"><label for="scheduleTarget">対象</label><select id="scheduleTarget"></select></div>
+<label>iPhone条件</label>
+<label class="check-row"><input type="radio" name="schedulePresence" value="any" checked>関係なし</label>
+<label class="check-row"><input type="radio" name="schedulePresence" value="present">iPhoneが在宅の時だけ実行</label>
+<label class="check-row"><input type="radio" name="schedulePresence" value="absent">iPhoneが不在の時だけ実行</label>
 <label class="check-row"><input id="scheduleEnabled" type="checkbox" checked>有効</label>
 <button class="start" type="submit" id="scheduleSubmit">登録</button>
 <button type="button" id="scheduleCancel" onclick="resetScheduleForm()" hidden>編集をやめる</button>
@@ -1693,6 +1965,10 @@ byId('spotifyControls').hidden=!data.spotify_configured;
 byId('spotifyStatus').textContent=data.spotify_error||(data.spotify_playing?`Spotify再生中: ${data.spotify_source?data.spotify_source.name:''}`:'Spotify停止');
 byId('ledSpotify').className='led'+(data.spotify_error?' error':data.spotify_playing?' on':'');
 renderSpotifySources(data.spotify_sources||[]);
+const phone=(data.presence_devices||[])[0];
+byId('presenceStatus').textContent=phone?`${phone.name}：${phone.state_label}`:'iPhone：未登録';
+byId('presenceDetail').textContent=phone?'最終確認：'+(phone.last_seen?phone.last_seen.replaceAll('-','/').replace('T',' ')+'（'+phone.last_seen_via+'）':'なし'):'';
+byId('ledPresence').className='led'+(phone&&phone.state==='present'?' on':'');
 const nowPlaying=data.spotify_now_playing;
 byId('spotifyNowTrack').textContent=nowPlaying?nowPlaying.track:'';
 byId('spotifyNowArtist').textContent=nowPlaying?nowPlaying.artist:'';
@@ -1754,8 +2030,9 @@ head.append(time,state);
 const when=document.createElement('div');when.textContent=scheduleWhen(task);
 const what=document.createElement('div');what.textContent=task.action_label+(task.target_label?': '+task.target_label:'');
 body.append(head,when,what);
+if(task.presence&&task.presence!=='any'){const cond=document.createElement('div');cond.textContent='iPhone条件: '+task.presence_label;body.appendChild(cond);}
 if(task.last_result){const result=document.createElement('div');result.className='schedule-meta'+(task.last_result.ok?'':' error');
-result.textContent=(task.last_result.ok?'前回実行 ':'前回失敗 ')+task.last_result.at.replace('T',' ')+' '+task.last_result.message;body.appendChild(result);}
+result.textContent=(task.last_result.skipped?'前回スキップ ':task.last_result.ok?'前回実行 ':'前回失敗 ')+task.last_result.at.replace('T',' ')+' '+task.last_result.message;body.appendChild(result);}
 const buttons=document.createElement('div');buttons.className='btn-row';
 const toggle=document.createElement('button');toggle.className=task.enabled?'stop':'start';toggle.textContent=task.enabled?'無効にする':'有効にする';
 toggle.onclick=()=>scheduleRequest('/api/schedules/'+task.id+'/enabled',{enabled:!task.enabled});
@@ -1775,6 +2052,7 @@ byId('scheduleFormTitle').textContent='新規登録';byId('scheduleSubmit').text
 function editSchedule(task){editingScheduleId=task.id;byId('scheduleTime').value=task.time;byId('scheduleRepeat').value=task.repeat;
 byId('scheduleWeekdays').querySelectorAll('input').forEach(input=>{input.checked=task.weekdays.includes(Number(input.value));});
 byId('scheduleDateTime').value=task.date?task.date+'T'+task.time:'';byId('scheduleAction').value=task.action;byId('scheduleEnabled').checked=task.enabled;
+document.querySelectorAll('input[name="schedulePresence"]').forEach(input=>{input.checked=input.value===(task.presence||'any');});
 byId('scheduleFormTitle').textContent='No.'+task.id+' を編集';byId('scheduleSubmit').textContent='更新';byId('scheduleCancel').hidden=false;
 updateScheduleForm(task.target===null?undefined:task.target);byId('scheduleForm').scrollIntoView({behavior:'smooth'});}
 async function saveSchedule(event){event.preventDefault();const repeat=byId('scheduleRepeat').value;
@@ -1784,7 +2062,8 @@ if(!time){alert('実行時刻を入力してください');return;}
 const body={time,repeat,
 weekdays:[...byId('scheduleWeekdays').querySelectorAll('input:checked')].map(input=>Number(input.value)),
 date:repeat==='once'?dateTime.slice(0,10):null,action:byId('scheduleAction').value,
-target:byId('scheduleTargetBox').hidden?null:byId('scheduleTarget').value,enabled:byId('scheduleEnabled').checked};
+target:byId('scheduleTargetBox').hidden?null:byId('scheduleTarget').value,enabled:byId('scheduleEnabled').checked,
+presence:(document.querySelector('input[name="schedulePresence"]:checked')||{value:'any'}).value};
 const url=editingScheduleId===null?'/api/schedules':'/api/schedules/'+editingScheduleId;
 if(await scheduleRequest(url,body))resetScheduleForm();}
 setInterval(()=>{if(!document.querySelector('.tab-panel[data-tab="schedule"]').hidden)loadSchedules();},10000);
@@ -2171,10 +2450,10 @@ def cleanup():
             process = upload_process
             if process is not None:
                 _terminate_group(process, process.pid)
-        for led in (record_led, ir_led):
+        for led in (record_led, ir_led, presence_led):
             if led is not None:
                 led.off()
-        for led in (record_led, ir_led):
+        for led in (record_led, ir_led, presence_led):
             if led is not None:
                 led.close()
         if oled_device is not None:
@@ -2214,7 +2493,7 @@ def configure_bluetooth_audio():
 
 def main():
     global record_led, ir_led, upload_thread, oled_device, oled_thread, spotify_poll_thread
-    global scheduler_thread
+    global scheduler_thread, presence_led, presence_thread
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     def request_shutdown(signum, frame):
         log.info("終了シグナル: %s", signal.Signals(signum).name)
@@ -2236,6 +2515,8 @@ def main():
         record_led.off()
         ir_led = LED(IR_LED_GPIO)
         ir_led.off()
+        presence_led = LED(PRESENCE_LED_GPIO)
+        presence_led.off()
         scanner = threading.Thread(target=keyboard_worker, daemon=True)
         scanner.start()
         upload_thread = threading.Thread(target=upload_worker, daemon=True)
@@ -2244,6 +2525,8 @@ def main():
         spotify_poll_thread.start()
         scheduler_thread = threading.Thread(target=scheduler_worker, daemon=True)
         scheduler_thread.start()
+        presence_thread = threading.Thread(target=presence_worker, daemon=True)
+        presence_thread.start()
         try:
             from luma.core.interface.serial import i2c
             from luma.oled.device import ssd1309
@@ -2276,6 +2559,8 @@ def main():
             spotify_poll_thread.join(timeout=2)
         if scheduler_thread is not None:
             scheduler_thread.join(timeout=2)
+        if presence_thread is not None:
+            presence_thread.join(timeout=2)
 
 
 if __name__ == "__main__":

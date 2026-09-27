@@ -176,7 +176,7 @@ OLEDには再生中に `SPOTIFY 現在番号/総数` と、取得できていれ
 直接操作せず `/dev/lirc1`（受信）・`/dev/lirc0`（送信）を `ir-ctl`
 （`v4l-utils`）経由で使用します。IR受信中・IR送信中はどちらもGPIO22の
 ステータスLEDを点灯します（構成: GPIO → 470Ω抵抗 → LED → GND）。
-受信と送信は同時に行われないため、1個のLEDで兼用しています。GPIO10（LED接続済み）は別機能のLED用に空けてあります。
+受信と送信は同時に行われないため、1個のLEDで兼用しています。GPIO10は「iPhone在宅判定」のLEDです。
 
 Web画面の「IRリモコン学習」から「IR録音開始」を押すと受信待機になり、
 その間GPIO22 LEDが点灯します。家電リモコンのボタンを押すと信号を取得し、
@@ -252,6 +252,14 @@ Web画面の「予定」タブから、指定した時刻に既存の機能を�
 - 実行時点で局やIR番号・Spotify再生リストが削除されていた場合、録音中でラジオを開始できない場合などは
   そのタスクだけ失敗として記録し、他のタスクやサービス全体には影響しません。
 - Ctrl+8・Webの緊急停止はスケジュール自体には影響しません（登録内容は残ります）。
+- 各タスクには共通の「iPhone条件」（`presence`）を設定できます。すべての機能に同じく適用されます。
+  - `any`（関係なし、既定）: iPhoneの状態に関係なく実行（判定不能でも実行）。
+  - `present`（在宅の時だけ実行）: 実行時点で「在宅」の場合のみ実行。
+  - `absent`（不在の時だけ実行）: 実行時点で「不在」の場合のみ実行。
+  - 「判定不能」の場合、`present`/`absent` はどちらも安全側でスキップします。
+  - 条件不一致はエラーにせず、ログに `iPhone在宅条件不一致のためスキップ` と記録し、
+    一覧の前回結果に「前回スキップ」と表示します（1回のみのタスクはその予定を終えたものとして削除）。
+  - `presence` 項目がない既存の `schedules.json` は `any` として読み込みます。
 
 登録内容は `schedules.json`（`listen.py`と同じディレクトリ、JSON）に保存され、
 サービスやRaspberry Piを再起動しても保持されます。保存は他の状態ファイルと同じく
@@ -270,11 +278,63 @@ HTTP API（Web画面と同じ共通処理を呼ぶ薄いラッパー）:
 
 ```json
 {"time": "07:00", "repeat": "weekly", "weekdays": [0, 1, 2, 3, 4],
- "action": "radio", "target": 2, "enabled": true}
+ "action": "radio", "target": 2, "enabled": true, "presence": "present"}
 ```
 
 `repeat` は `daily` / `weekly`（`weekdays` は0=月〜6=日）/ `once`（`date` に `YYYY-MM-DD`）、
-`action` は `radio` / `mp3` / `spotify`（`target` に `spotify_id`）/ `ir` / `record_start` / `record_stop` / `playback_stop` です。
+`action` は `radio` / `mp3` / `spotify`（`target` に `spotify_id`）/ `ir` / `record_start` / `record_stop` / `playback_stop`、
+`presence` は `any`（省略時）/ `present` / `absent` です。
+
+## iPhone在宅判定
+
+登録したiPhoneが家にいるかをWi-FiとBluetoothで判定し、GPIO10のLED・Web画面の状態欄・
+スケジュールの「iPhone条件」に使います。距離は測らず、状態は次の3つだけです。
+
+| 状態 | 意味 | GPIO10 LED |
+| --- | --- | --- |
+| 在宅（`present`） | Wi-FiまたはBluetoothで確認できた | 点灯 |
+| 不在（`absent`） | 確認手段は動いているが、最後の確認から一定時間見つからない | 消灯 |
+| 判定不能（`unknown`） | 起動後まだ一度も判定できていない／確認手段自体が一定時間失敗し続けた | 消灯 |
+
+判定方法（バックグラウンドのスレッドで30秒ごと。Web・キーボード・スケジュールは待たされません）:
+
+1. **Wi-Fi/LAN**: Piが接続しているLAN（現在は192.168.2.0/24）の全アドレスのmDNSポート（5353）へ
+   空のUDPパケットを送ってARP解決を起こし、`ip -j -s neigh` で登録MACアドレスのARP応答（`confirmed`）が
+   直近60秒以内にあるかを見ます。宛先を5353にしているのは、iPhoneが常に開けているポートのため
+   ICMPエラーを返さず、その返信のためのARP要求でPiの記録が「未確認」に上書きされるのを防ぐためです
+   （実機で、閉じたポート宛てでは一度も検出できず、5353宛てでは安定して検出できることを確認済み）。root権限は不要です。IPアドレスではなくMACアドレスで探すため
+   DHCPでIPが変わっても影響せず、スリープ中で `ping` に応答しないiPhoneもARPには応答しやすい方法です。
+2. **Bluetooth**: Wi-Fiで見つからなかった時だけ `hcitool name <Bluetoothアドレス>` を実行します
+   （root・ペアリング不要。見つかれば1秒未満、いなければ約5秒）。ラジオ・MP3・Spotifyの再生中は、
+   同じBluetoothドングルでJQ-BTへ音を送っているため、音途切れを避けてBluetooth確認は行いません
+   （再生中はWi-Fiのみで判定）。
+
+1回見つからなかっただけでは不在にしません。最後に確認できた時刻（`last_seen`）から
+`PRESENCE_ABSENT_TIMEOUT_SECONDS`（既定300秒）以上、どちらでも確認できなければ「不在」にします。
+Wi-Fi（ネットワーク情報の取得）とBluetoothの両方がエラーのまま同じ時間が経つと「判定不能」にします。
+サービス起動直後は「判定不能」から始まり、自動的に判定を再開します。外部コマンドはすべて
+タイムアウト付きで、判定処理のエラーは他の機能（録音・radiko・MP3・Spotify・IR・OLED・Web）に影響しません。
+
+Web画面の状態欄には `iPhone：在宅` と `最終確認：2026/09/27 10:15:32（Wi-Fi）` のように表示されます
+（`/api/status` の `presence_devices`、1秒ごとに更新）。状態が変わるとログに `[在宅判定]` として記録されます。
+
+登録端末は `presence_devices.json`（`listen.py`と同じディレクトリ）に書きます。将来の複数端末・
+端末連携機能に備えてリスト形式です（現在の画面・スケジュール条件は先頭の1台を使います）。
+変更後はサービスを再起動してください。
+
+```json
+{"devices": [{"id": "iphone", "name": "iPhone",
+              "bluetooth_address": "8C:33:96:18:F4:AD", "wifi_mac": "8c:33:96:1e:bf:1a"}]}
+```
+
+- `wifi_mac`: iPhoneがこの家のWi-Fiで使うMACアドレス。iPhoneの「設定 > Wi-Fi > (i)」の
+  「プライベートWi-Fiアドレス」を「ローテーション」にするとアドレスが変わって検出できなくなるため、
+  「固定」または「オフ」にしてください。ルーターの接続端末一覧でも確認できます。
+- `bluetooth_address`: iPhoneの「設定 > 一般 > 情報 > Bluetooth」。
+- どちらか一方だけでも動作します。ファイルがない・壊れている場合は常に「判定不能」で、他の機能は動き続けます。
+
+設定（`.env`、変更後はサービス再起動）: `PRESENCE_ABSENT_TIMEOUT_SECONDS`（既定300）、
+`PRESENCE_CHECK_INTERVAL_SECONDS`（既定30）。
 
 ## セットアップ
 
@@ -283,7 +343,7 @@ cd /home/akimoto/voice-control
 python3 -m venv --system-site-packages venv
 venv/bin/pip install -r requirements.txt
 # 録音には alsa-utils の arecord、radiko 再生には curl と mpv、アップロードには rclone、
-# IRリモコンには v4l-utils の ir-ctl が必要
+# IRリモコンには v4l-utils の ir-ctl、iPhone在宅判定には bluez の hcitool と iproute2 の ip が必要
 sudo cp voice-control.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now voice-control.service
@@ -340,7 +400,7 @@ OLEDが未接続または故障していても、録音・ラジオ機能は継�
 Bluetoothスピーカーなど出力先を固定する場合は `mpv --audio-device=help` で名前を
 確認し、`.env` に `MPV_AUDIO_DEVICE=pipewire/bluez_output...` を設定してください。
 
-設定可能な環境変数は `WEB_HOST`、`WEB_PORT`、`RECORDINGS_DIR`、`GDRIVE_DIR`、`OLED_PORT`、`OLED_ADDRESS`、`SPOTIFY_CLIENT_ID`、`SPOTIFY_CLIENT_SECRET`、`SPOTIFY_REFRESH_TOKEN`、`SPOTIFY_DEVICE_NAME` です。放送局は `stations.conf` に番号付きINI形式で登録します。radiko プレミアムを使う場合の資格情報は既存の `.env` に設定します。Spotifyのセットアップは「Spotify再生」の章を参照してください。
+設定可能な環境変数は `WEB_HOST`、`WEB_PORT`、`RECORDINGS_DIR`、`GDRIVE_DIR`、`OLED_PORT`、`OLED_ADDRESS`、`SPOTIFY_CLIENT_ID`、`SPOTIFY_CLIENT_SECRET`、`SPOTIFY_REFRESH_TOKEN`、`SPOTIFY_DEVICE_NAME`、`PRESENCE_ABSENT_TIMEOUT_SECONDS`、`PRESENCE_CHECK_INTERVAL_SECONDS` です。放送局は `stations.conf` に番号付きINI形式で登録します。radiko プレミアムを使う場合の資格情報は既存の `.env` に設定します。Spotifyのセットアップは「Spotify再生」の章を参照してください。
 
 ## 起動時のJQ-BTプロファイル設定
 

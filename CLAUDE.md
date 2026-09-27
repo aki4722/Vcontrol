@@ -79,8 +79,28 @@ share this state:
   state is guarded by `control_lock`; due tasks are marked (`last_run`, persisted) under
   the lock, then executed *outside* it. First tick after startup only records a baseline,
   and it never looks back more than `SCHEDULE_CATCHUP_SECONDS`, so past-due tasks don't
-  fire after a restart or NTP jump. See README「スケジュール」 for the exact rules.
+  fire after a restart or NTP jump. Every task has a common `presence` condition
+  (`any`/`present`/`absent`, missing → `any` for old files) checked in `run_due_schedules`
+  for all actions alike; mismatches (and UNKNOWN for present/absent) are skipped, not
+  failed (`last_result.skipped`). See README「スケジュール」 for the exact rules.
 - `spotify_poll_worker` polls now-playing info while Spotify is active.
+- **`presence_worker`** — every `PRESENCE_CHECK_INTERVAL_SECONDS` calls `check_presence()`
+  for devices registered in `presence_devices.json` (list of `{id, name, bluetooth_address,
+  wifi_mac}`, loaded once at startup; runtime `state`/`last_seen` are in-memory only, so
+  every start begins UNKNOWN). Wi-Fi: sends an empty mDNS header to UDP 5353 on every host of
+  the Pi's IPv4 subnets to trigger ARP, then reads `ip -j -s neigh` and treats a MAC as seen
+  if its `confirmed` age is within probe time + `PRESENCE_ARP_RECENT_SECONDS` (60; REACHABLE
+  entries aren't re-verified by the kernel). Don't switch the probe to a closed port: the
+  iPhone's ICMP-unreachable reply is preceded by its own ARP request, which resets the Pi's
+  entry to STALE without confirmation — verified on hardware to never detect. Bluetooth:
+  `hcitool name` (no root/pairing), only if Wi-Fi didn't find it, and **never while radio/
+  MP3/Spotify is playing** (paging an absent phone takes ~5s on the same dongle that streams
+  to JQ-BT → dropout risk). `l2ping` needs root, so it's not used. External commands run
+  outside `control_lock` with timeouts; results are applied under the lock by
+  `_apply_presence_result` (PRESENT on any sighting; ABSENT after
+  `PRESENCE_ABSENT_TIMEOUT_SECONDS` without a sighting while checks work; UNKNOWN after the
+  same time with every check failing). Other code must only read via `presence_state()` /
+  `presence_snapshot()` — the scheduler doesn't know how detection works.
 
 **Radio, MP3-loop, and recording are mutually exclusive** and share one "playback slot"
 (`radio_process`/`radio_pgid`/`current_station`) — starting one stops whatever is
@@ -155,7 +175,7 @@ same atomic `.tmp`-then-`Path.replace()` write pattern as `save_station_number`.
   never via `gpiozero`/raw GPIO. GPIO22 → single IR status LED (`ir_led`), lit while
   receiving *or* transmitting — the two are mutually exclusive via `ir_state`, so one LED
   suffices (same `gpiozero.LED` pattern as GPIO27, distinct purpose — don't conflate them).
-  GPIO10 (LED still wired) is reserved for a future, different status LED. `/dev/lirc*`
+  GPIO10 → iPhone presence LED (`presence_led`, on only while PRESENT). `/dev/lirc*`
   are `root:video` (fixed OS udev rule), so both the systemd service
   (`SupplementaryGroups=`) and any manual-run user need the `video` group.
 - **Known EMI issue**: keep the external USB Bluetooth dongle (TP-Link UB500,

@@ -74,6 +74,13 @@ class ControlsTest(unittest.TestCase):
         app.schedules = {}
         app.schedule_next_id = 1
         app.scheduler_last_checked = None
+        self.presence_file = Path(directory.name) / 'presence_devices.json'
+        patcher = patch.object(app, 'PRESENCE_DEVICES_FILE', self.presence_file)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        app.presence_devices = []
+        app.presence_led = Mock()
+        app.presence_started_at = 0.0
         patcher = patch.multiple(app, SPOTIFY_CLIENT_ID='client-id', SPOTIFY_CLIENT_SECRET='secret',
                                   SPOTIFY_REFRESH_TOKEN='refresh-token')
         patcher.start()
@@ -1269,6 +1276,241 @@ class ControlsTest(unittest.TestCase):
         self.assertIsNone(app.radio_process)  # 既存仕様どおりラジオを止める
         self.assertEqual(thread.call_args.kwargs['target'], app._spotify_play_worker)
 
+
+    # ---- 在宅判定 ----
+    def make_presence_device(self, **fields):
+        self.presence_file.write_text(json.dumps({'devices': [dict({
+            'id': 'iphone', 'name': 'iPhone', 'bluetooth_address': '8C:33:96:18:F4:AD',
+            'wifi_mac': '8c:33:96:1e:bf:1a'}, **fields)]}))
+        app.presence_devices = app._load_presence_devices()
+        return app.presence_devices[0]
+
+    def test_presence_load_devices(self):
+        with self.assertLogs(app.log, level='INFO'):
+            self.assertEqual(app._load_presence_devices(), [])  # ファイルなし
+        device = self.make_presence_device()
+        self.assertEqual((device['bluetooth_address'], device['wifi_mac'], device['state'], device['last_seen']),
+                         ('8c:33:96:18:f4:ad', '8c:33:96:1e:bf:1a', 'unknown', None))
+        for bad in ('{broken', json.dumps({'devices': [{'id': 'x', 'wifi_mac': 'zz'}]}),
+                    json.dumps({'devices': [{'id': 'x'}]}),
+                    json.dumps({'devices': [{'id': 'x', 'wifi_mac': '00:11:22:33:44:55'}] * 2})):
+            with self.subTest(bad=bad):
+                self.presence_file.write_text(bad)
+                with self.assertLogs(app.log, level='ERROR'):
+                    self.assertEqual(app._load_presence_devices(), [])
+        self.presence_file.write_text(json.dumps({'devices': [{'id': 'wifi-only', 'wifi_mac': '00:11:22:33:44:55'}]}))
+        self.assertIsNone(app._load_presence_devices()[0]['bluetooth_address'])
+
+    def test_presence_state_transitions(self):
+        device = self.make_presence_device()
+        timeout = app.PRESENCE_ABSENT_TIMEOUT_SECONDS
+        # 起動直後、まだ一度も確認できていない間はUNKNOWN。
+        app._apply_presence_result(device, None, True, 10)
+        self.assertEqual(device['state'], 'unknown')
+        with self.assertLogs(app.log, level='INFO'):
+            app._apply_presence_result(device, 'Wi-Fi', True, 20)
+        self.assertEqual((device['state'], device['last_seen_via']), ('present', 'Wi-Fi'))
+        self.assertIsNotNone(device['last_seen'])
+        # 1回見つからないだけでは不在にしない。
+        app._apply_presence_result(device, None, True, 20 + timeout - 1)
+        self.assertEqual(device['state'], 'present')
+        with self.assertLogs(app.log, level='INFO'):
+            app._apply_presence_result(device, None, True, 20 + timeout)
+        self.assertEqual(device['state'], 'absent')
+        app._apply_presence_result(device, 'Bluetooth', True, 1000)
+        self.assertEqual((device['state'], device['last_seen_via']), ('present', 'Bluetooth'))
+        # 確認手段自体が失敗し続けた場合はタイムアウト後にUNKNOWN。
+        app._apply_presence_result(device, None, False, 1000 + timeout - 1)
+        self.assertEqual(device['state'], 'present')
+        with self.assertLogs(app.log, level='INFO'):
+            app._apply_presence_result(device, None, False, 1000 + timeout)
+        self.assertEqual(device['state'], 'unknown')
+
+    def test_presence_never_seen_becomes_absent_after_timeout(self):
+        device = self.make_presence_device()
+        app.presence_started_at = 100.0
+        app._apply_presence_result(device, None, True, 100 + app.PRESENCE_ABSENT_TIMEOUT_SECONDS - 1)
+        self.assertEqual(device['state'], 'unknown')
+        with self.assertLogs(app.log, level='INFO'):
+            app._apply_presence_result(device, None, True, 100 + app.PRESENCE_ABSENT_TIMEOUT_SECONDS)
+        self.assertEqual(device['state'], 'absent')
+
+    def test_check_presence_uses_wifi_then_bluetooth_and_drives_led(self):
+        self.make_presence_device()
+        with patch.object(app, '_presence_scan_wifi', return_value={'8c:33:96:1e:bf:1a'}), \
+             patch.object(app, '_presence_check_bluetooth') as bluetooth, self.assertLogs(app.log, level='INFO'):
+            app.check_presence()
+        bluetooth.assert_not_called()  # Wi-Fiで見つかればBluetoothは使わない
+        self.assertEqual(app.presence_state(), 'present')
+        self.assertEqual(app.presence_devices[0]['last_seen_via'], 'Wi-Fi')
+        app.presence_led.on.assert_called_once_with()
+        with patch.object(app, '_presence_scan_wifi', return_value=set()), \
+             patch.object(app, '_presence_check_bluetooth', return_value=True) as bluetooth:
+            app.check_presence()
+        bluetooth.assert_called_once_with('8c:33:96:18:f4:ad')
+        self.assertEqual(app.presence_devices[0]['last_seen_via'], 'Bluetooth')
+        # 不在になればLEDを消す。
+        app.presence_devices[0]['seen_at'] = -app.PRESENCE_ABSENT_TIMEOUT_SECONDS
+        with patch.object(app, '_presence_scan_wifi', return_value=set()), \
+             patch.object(app, '_presence_check_bluetooth', return_value=False), \
+             patch.object(app.time, 'monotonic', return_value=0.0), self.assertLogs(app.log, level='INFO'):
+            app.check_presence()
+        self.assertEqual(app.presence_state(), 'absent')
+        app.presence_led.off.assert_called()
+
+    def test_check_presence_skips_bluetooth_while_playing(self):
+        self.make_presence_device()
+        for playing in ('radio', 'spotify'):
+            with self.subTest(playing=playing):
+                app.radio_process = Mock() if playing == 'radio' else None
+                app.spotify_current_source = {'name': 'x'} if playing == 'spotify' else None
+                with patch.object(app, '_presence_scan_wifi', return_value=set()), \
+                     patch.object(app, '_presence_check_bluetooth') as bluetooth:
+                    app.check_presence()
+                bluetooth.assert_not_called()
+
+    def test_check_presence_without_devices_does_nothing(self):
+        with patch.object(app, '_presence_scan_wifi') as wifi, patch.object(app, '_presence_check_bluetooth') as bt:
+            app.check_presence()
+        wifi.assert_not_called()
+        bt.assert_not_called()
+        self.assertEqual(app.presence_state(), 'unknown')
+
+    def test_presence_scan_wifi_uses_fresh_arp_confirmations_only(self):
+        addr = json.dumps([{'ifname': 'wlan0', 'addr_info': [
+            {'family': 'inet', 'local': '192.0.2.1', 'prefixlen': 29}]}])
+        neigh = json.dumps([
+            {'dst': '192.0.2.2', 'lladdr': '8C:33:96:1E:BF:1A', 'confirmed': 0, 'state': ['REACHABLE']},
+            {'dst': '192.0.2.3', 'lladdr': '00:11:22:33:44:55', 'confirmed': 500, 'state': ['STALE']},
+            {'dst': '192.0.2.5', 'lladdr': '00:11:22:33:44:66', 'confirmed': 45, 'state': ['REACHABLE']},
+            {'dst': '192.0.2.4', 'state': ['FAILED']},
+        ])
+        results = [Mock(stdout=addr), Mock(stdout=neigh)]
+        sock = Mock()
+        with patch.object(app.subprocess, 'run', side_effect=results) as run, \
+             patch.object(app.socket, 'socket') as socket_factory, \
+             patch.object(app, 'PRESENCE_ARP_WAIT_SECONDS', 0):
+            socket_factory.return_value.__enter__ = Mock(return_value=sock)
+            socket_factory.return_value.__exit__ = Mock(return_value=False)
+            seen = app._presence_scan_wifi()
+        # 60秒以内に確認済み（REACHABLEで再確認されないもの）も在宅扱い、500秒前は古い。
+        self.assertEqual(seen, {'8c:33:96:1e:bf:1a', '00:11:22:33:44:66'})
+        self.assertEqual({c.args[1][1] for c in sock.sendto.call_args_list}, {5353})
+        sent = [c.args[1][0] for c in sock.sendto.call_args_list]
+        self.assertEqual(sent, [f'192.0.2.{n}' for n in range(2, 7)])  # 自分自身は除く
+        for c in run.call_args_list:
+            self.assertEqual(c.kwargs['timeout'], app.PRESENCE_COMMAND_TIMEOUT_SECONDS)
+
+    def test_presence_scan_wifi_failures_return_none(self):
+        for error in (FileNotFoundError('ip'), app.subprocess.TimeoutExpired('ip', 3)):
+            with self.subTest(error=type(error)), patch.object(app.subprocess, 'run', side_effect=error), \
+                 self.assertLogs(app.log, level='WARNING'):
+                self.assertIsNone(app._presence_scan_wifi())
+        with patch.object(app.subprocess, 'run', return_value=Mock(stdout='[]')):
+            self.assertIsNone(app._presence_scan_wifi())  # IPv4未接続
+
+    def test_presence_check_bluetooth(self):
+        cases = [(Mock(returncode=0, stdout='iPhone 16e\n', stderr=''), True),
+                 (Mock(returncode=0, stdout='', stderr=''), False),
+                 (Mock(returncode=1, stdout='', stderr='Device is not available.'), None),
+                 (app.subprocess.TimeoutExpired('hcitool', 10), None),
+                 (FileNotFoundError('hcitool'), None)]
+        for outcome, expected in cases:
+            with self.subTest(outcome=outcome), patch.object(app.subprocess, 'run', side_effect=[outcome]) as run:
+                if expected is None:
+                    with self.assertLogs(app.log, level='WARNING'):
+                        self.assertIsNone(app._presence_check_bluetooth('8c:33:96:18:f4:ad'))
+                else:
+                    self.assertIs(app._presence_check_bluetooth('8c:33:96:18:f4:ad'), expected)
+            self.assertEqual(run.call_args.args[0], ['hcitool', 'name', '8c:33:96:18:f4:ad'])
+            self.assertEqual(run.call_args.kwargs['timeout'], app.PRESENCE_BT_TIMEOUT_SECONDS)
+
+    def test_presence_worker_survives_exceptions(self):
+        waits = []
+        def fake_wait(timeout):
+            waits.append(timeout)
+            if len(waits) == 2:
+                app.shutdown_event.set()
+            return app.shutdown_event.is_set()
+        with patch.object(app, 'check_presence', side_effect=[RuntimeError('boom'), None]) as check, \
+             patch.object(app.shutdown_event, 'wait', side_effect=fake_wait), \
+             self.assertLogs(app.log, level='ERROR'):
+            app.presence_worker()
+        self.assertEqual(check.call_count, 2)
+        self.assertEqual(waits, [app.PRESENCE_CHECK_INTERVAL_SECONDS] * 2)
+
+    def test_status_and_index_show_presence(self):
+        device = self.make_presence_device()
+        client = app.app.test_client()
+        with patch.object(app, 'get_volume', return_value=50):
+            data = client.get('/api/status').json
+        self.assertEqual(data['presence_devices'], [{'id': 'iphone', 'name': 'iPhone', 'state': 'unknown',
+                                                     'state_label': '判定不能', 'last_seen': None, 'last_seen_via': None}])
+        device.update(state='present', last_seen='2026-09-27T10:15:32', last_seen_via='Wi-Fi')
+        with patch.object(app, 'get_volume', return_value=50):
+            self.assertEqual(client.get('/api/status').json['presence_devices'][0]['state_label'], '在宅')
+        html = client.get('/').get_data(as_text=True)
+        self.assertIn('id="presenceStatus"', html)
+        self.assertIn('name="schedulePresence" value="absent"', html)
+
+    def test_schedule_presence_field_validation_and_backward_compat(self):
+        self.assertEqual(self.add_schedule()['presence'], 'any')  # 未指定はany
+        self.assertEqual(self.add_schedule(presence='present')['presence'], 'present')
+        self.assertEqual(self.add_schedule(presence=None)['presence'], 'any')
+        ok, message, task = app.create_schedule({'time': '07:00', 'repeat': 'daily',
+                                                 'action': 'record_stop', 'presence': 'maybe'})
+        self.assertFalse(ok)
+        # 既存のschedules.json（presence項目なし）はanyとして読み込み、保存時に項目を補う。
+        self.schedules_file.write_text(json.dumps({'next_id': 7, 'tasks': [{
+            'time': '08:00', 'repeat': 'daily', 'weekdays': [], 'date': None, 'action': 'radio',
+            'target': 1, 'enabled': True, 'id': 6, 'last_run': '2026-09-27T08:00',
+            'last_result': {'ok': True, 'message': 'ラジオ再生を開始しました', 'at': '2026-09-27T08:00:00'}}]}))
+        loaded, next_id = app._load_schedules()
+        self.assertEqual((loaded[6]['presence'], loaded[6]['target'], next_id), ('any', 1, 7))
+        self.assertEqual(loaded[6]['last_run'], '2026-09-27T08:00')
+        app.schedules = {}
+        self.add_schedule(presence='absent')
+        self.assertEqual(app.list_schedules()['tasks'][0]['presence_label'], 'iPhoneが不在の時だけ実行')
+
+    def test_scheduler_presence_condition_matrix_for_every_action(self):
+        expected = {  # (条件, 状態): 実行するか
+            ('any', 'present'): True, ('any', 'absent'): True, ('any', 'unknown'): True,
+            ('present', 'present'): True, ('present', 'absent'): False, ('present', 'unknown'): False,
+            ('absent', 'present'): False, ('absent', 'absent'): True, ('absent', 'unknown'): False,
+        }
+        for action in app.SCHEDULE_ACTIONS:
+            for (condition, state), should_run in expected.items():
+                with self.subTest(action=action, condition=condition, state=state):
+                    app.schedules = {}
+                    app.schedule_next_id = 1
+                    app.schedules[1] = {'time': '07:00', 'repeat': 'daily', 'weekdays': [], 'date': None,
+                                        'action': action, 'target': 1, 'enabled': True, 'presence': condition,
+                                        'id': 1, 'last_run': None, 'last_result': None}
+                    app.scheduler_last_checked = app.datetime(2026, 9, 28, 6, 59, 59)
+                    with patch.object(app, 'presence_state', return_value=state), \
+                         patch.object(app, '_execute_schedule_action', return_value=(True, 'done')) as execute, \
+                         self.assertLogs(app.log, level='INFO') as logs:
+                        results = app.run_due_schedules(app.datetime(2026, 9, 28, 7, 0, 1))
+                    self.assertEqual(execute.called, should_run)
+                    self.assertTrue(results[0][1])  # スキップもエラーにしない
+                    last_result = app.schedules[1]['last_result']
+                    if should_run:
+                        self.assertNotIn('skipped', last_result)
+                    else:
+                        self.assertTrue(last_result['skipped'])
+                        self.assertIn('iPhone在宅条件不一致のためスキップ', results[0][2])
+                        self.assertTrue(any('iPhone在宅条件不一致のためスキップ' in line for line in logs.output))
+
+    def test_scheduler_presence_uses_real_state_without_devices(self):
+        # 端末未登録（UNKNOWN）でもanyは通常実行、presentはスキップ。
+        self.add_schedule(time='07:00')
+        self.add_schedule(time='07:00', presence='present')
+        with patch.object(app, 'stop_recording', return_value=True) as stop:
+            app.scheduler_last_checked = app.datetime(2026, 9, 28, 6, 59, 59)
+            results = app.run_due_schedules(app.datetime(2026, 9, 28, 7, 0, 1))
+        stop.assert_called_once_with()
+        self.assertEqual([r[0] for r in results], [1, 2])
+        self.assertTrue(app.schedules[2]['last_result']['skipped'])
 
 if __name__ == '__main__':
     unittest.main()
